@@ -230,12 +230,24 @@ class TextualAttentionBlock(nn.Module):
     discarded once Stage 1 ends -- cache_text_anchors.py reads their state once to build the
     frozen text-prototype table Stage 2 actually uses, and neither is loaded again afterward.
 
-    No gate, no residual, unlike VisualAttentionBlock: this class's own life ends the moment Stage
-    1 does, so there's no "does this stay a no-op at inference" concern to guard against the way
-    there is for VAB.
+    Zero-init tanh-gated residual (`gated=True`, the default), same convention as every other
+    trainable block in this file. This block used to have no gate and no residual ("training-
+    only, so no no-op-at-inference concern") -- but "training-only" doesn't make its output
+    harmless, because its output is exactly what gets cached as Stage 2's text prototypes.
+    Measured on a fully-trained ungated checkpoint (2026-09-17, see progress.md): the mixed ctx
+    tokens came out at norm ~34 vs ~0.4 for the learnable ctx and for CLIP's own token
+    embeddings around them (the learnable ctx was numerically irrelevant to the prompt), the
+    branch-to-branch attention was near-uniform (mean diagonal 0.131 vs 0.143 uniform), and the
+    K part prompts of one identity landed at cosine 0.98 in the joint space -- the parts had
+    collapsed into one identity vector, through this block. Gating fixes the scale (at init the
+    prompt IS ctx, at CLIP token scale) and removes the free one-step collapse path (uniform
+    mixing now has to be learned against an objective, not inherited from a random init).
+    `gated=False` only exists so cache_text_anchors.py can still replay checkpoints trained
+    before this change (their state dict has no `gate` key; an ungated output is not
+    representable by the gated form).
     """
 
-    def __init__(self, ctx_dim, n_ctx, num_heads=4, num_layers=1):
+    def __init__(self, ctx_dim, n_ctx, num_heads=4, num_layers=1, gated=True):
         super(TextualAttentionBlock, self).__init__()
         layer = nn.TransformerEncoderLayer(
             d_model=ctx_dim, nhead=num_heads, dim_feedforward=ctx_dim * 2,
@@ -244,6 +256,9 @@ class TextualAttentionBlock(nn.Module):
         self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers)
         self.n_ctx = n_ctx
         self.num_heads = num_heads
+        self.gated = gated
+        if gated:
+            self.gate = nn.Parameter(torch.zeros(1))
 
     def forward(self, ctx_tokens, branch_visibility):
         """ctx_tokens: [B, M*n_ctx, ctx_dim] -- one batch's raw per-identity branch context, laid
@@ -266,7 +281,14 @@ class TextualAttentionBlock(nn.Module):
         M = branch_visibility.size(1)
         token_visibility = branch_visibility.repeat_interleave(self.n_ctx, dim=1)  # [B, M*n_ctx]
         attn_bias = _visibility_attn_bias(token_visibility, self.num_heads)
-        mixed, attn_full = _replay_with_attention(self.encoder, ctx_tokens, attn_bias)
+        relation_out, attn_full = _replay_with_attention(self.encoder, ctx_tokens, attn_bias)
+        if self.gated:
+            # tanh(gate) * delta: the transformer's own output already carries ctx_tokens via its
+            # internal residuals, so the gated quantity is its deviation from ctx, not the whole
+            # output -- at gate=0 the prompt is exactly the raw learnable ctx.
+            mixed = ctx_tokens + torch.tanh(self.gate) * (relation_out - ctx_tokens)
+        else:
+            mixed = relation_out
         B = attn_full.size(0)
         attn = attn_full.view(B, M, self.n_ctx, M, self.n_ctx).sum(dim=4).mean(dim=2)
         return mixed, attn

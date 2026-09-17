@@ -120,8 +120,16 @@ class ClipViTDenseBackbone(nn.Module):
         convention for every embedding a loss touches."""
         return (self.ln_post(patch_feats.type(self.dtype)) @ self.proj).float()
 
+    def project_dense(self, patch_feats):
+        """Same as project(): ln_post + proj is already a per-token affine map with no attention
+        in it (the V-V surgery in forward() is what keeps each token's own identity), so the
+        MaskCLIP-style attention-free dense projection ClipRN50DenseBackbone.project_dense()
+        builds separately is exactly this method here. Exposed under the shared name so
+        ClipBPAMEncoder can call backbone.project_dense() regardless of arch."""
+        return self.project(patch_feats)
+
 
 def ClipViTBPAMEncoder(clip_arch='ViT-L/14', height=384, width=128, num_parts=5,
-                        checkpoint_path=None, device='cuda'):
+                        checkpoint_path=None, device='cuda', mask_temperature=0.07):
     backbone = ClipViTDenseBackbone(clip_arch, height, width, device)
-    return ClipBPAMEncoder(backbone, num_parts, checkpoint_path, device)
+    return ClipBPAMEncoder(backbone, num_parts, checkpoint_path, device, mask_temperature)

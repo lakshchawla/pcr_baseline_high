@@ -119,7 +119,7 @@ class ClipRN50DenseBackbone(nn.Module):
         x = x + self.positional_embedding[:, None, :].to(x.dtype)
         ap = self.attnpool
         out, _ = F.multi_head_attention_forward(
-            query=x[:1], key=x, value=x,
+            query=x, key=x, value=x,
             embed_dim_to_check=x.shape[-1], num_heads=self.num_heads,
             q_proj_weight=ap.q_proj.weight, k_proj_weight=ap.k_proj.weight, v_proj_weight=ap.v_proj.weight,
             in_proj_weight=None,
@@ -159,8 +159,24 @@ class ClipRN50DenseBackbone(nn.Module):
         out = self._attnpool_forward(patch_feats)
         return out[1:].permute(1, 0, 2).float(), out[0].float()
 
+    def project_dense(self, patch_feats):
+        """MaskCLIP-style dense projection (Zhou et al., "Extract Free Dense Labels from CLIP",
+        ECCV 2022): v_proj -> c_proj applied per patch, nothing else. Of AttentionPool2d's four
+        projections, v_proj and c_proj are the only two every location's own information
+        actually passes through on the way to CLIP's pretrained output (attention-weighted, but
+        present) -- composing them directly per patch gives a dense map that stays in CLIP's real
+        joint space without any query/key/softmax step, mean token, or positional embedding (a
+        per-patch affine transform doesn't care where the patch is). Deliberately does NOT call
+        _attnpool_forward()/multi_head_attention_forward at all, so it's independent of
+        project()/project_all()'s own attention path. patch_feats: [B, N, vision_width] (raw,
+        from forward()). Returns [B, N, embed_dim], float32 like every other projection here."""
+        ap = self.attnpool
+        x = patch_feats.type(self.dtype)
+        v = F.linear(x, ap.v_proj.weight, ap.v_proj.bias)
+        return F.linear(v, ap.c_proj.weight, ap.c_proj.bias).float()
+
 
 def ClipRN50BPAMEncoder(clip_arch='RN50', height=384, width=128, num_parts=5,
-                         checkpoint_path=None, device='cuda'):
+                         checkpoint_path=None, device='cuda', mask_temperature=0.07):
     backbone = ClipRN50DenseBackbone(clip_arch, height, width, device)
-    return ClipBPAMEncoder(backbone, num_parts, checkpoint_path, device)
+    return ClipBPAMEncoder(backbone, num_parts, checkpoint_path, device, mask_temperature)

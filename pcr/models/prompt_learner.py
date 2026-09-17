@@ -39,7 +39,8 @@ class PromptLearner(nn.Module):
     """
 
     def __init__(self, num_identities, num_parts, clip_text_encoder, n_ctx=4,
-                 tab_num_heads=4, tab_num_layers=1, device='cuda', has_global_branch=False):
+                 tab_num_heads=4, tab_num_layers=1, device='cuda', has_global_branch=False,
+                 tab_gated=True):
         """has_global_branch: must match the image encoder's own ClipBPAMEncoder._has_global --
         True only for ClipRN50BPAMEncoder currently (see that class's own docstring: a genuine
         7th branch, CLIP's own native whole-image embedding, appended after foreground+parts).
@@ -80,8 +81,9 @@ class PromptLearner(nn.Module):
         nn.init.normal_(ctx_vectors, std=0.02)
         self.ctx = nn.Parameter(ctx_vectors)
 
+        # tab_gated=False only for replaying pre-gate checkpoints (see TextualAttentionBlock).
         self.tab = TextualAttentionBlock(ctx_dim, n_ctx=n_ctx, num_heads=tab_num_heads,
-                                          num_layers=tab_num_layers)
+                                          num_layers=tab_num_layers, gated=tab_gated)
         self.prompt_dtype = dtype
 
         # not trained, but must move with the module (.cuda()/.to()) -- registered as buffers

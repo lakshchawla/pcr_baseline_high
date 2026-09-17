@@ -17,6 +17,8 @@ import torch.nn.functional as F
 
 from torchreid.models.bpbreid import PixelToPartClassifier
 
+from .clip_native_masks import clip_native_part_masks
+
 # CLIP's own image normalization -- NOT BPBreID's ImageNet stats. Pretrained CLIP weights are
 # calibrated for this specific normalization; using the wrong one silently degrades every
 # downstream similarity score.
@@ -62,11 +64,29 @@ class ClipBPAMEncoder(nn.Module):
     Visibility for this extra branch is a constant 1.0 -- it isn't attention-weighted by any part
     mask, so "visibility" isn't a meaningful concept for it the way it is for foreground/parts;
     always-observed is the accurate semantics, not a placeholder.
+
+    Optional CLIP-native mask blend (Stage 1 only, off by default -- see _forward_common): when
+    a caller passes this batch's own per-identity text contexts plus a blend weight, the pixel
+    classifier's part assignment is blended with a MaskCLIP-style, text-matched one
+    (pcr/models/clip_native_masks.py) before any pooling happens. mask_temperature is that
+    text-matching softmax's temperature; it does nothing unless a caller actually opts in.
     """
 
-    def __init__(self, backbone, num_parts=5, checkpoint_path=None, device='cuda'):
+    def __init__(self, backbone, num_parts=5, checkpoint_path=None, device='cuda', mask_temperature=0.07):
         super(ClipBPAMEncoder, self).__init__()
         self.backbone = backbone
+        self.mask_temperature = mask_temperature
+        # Side channel for the mask blend, set by the last forward that actually blended (None
+        # otherwise); never read by the forward path itself. Keys:
+        #   'anchor_loss'  -- scalar WITH gradient: foreground-weighted reverse KL of the
+        #                     text-matched part assignment against the classifier's own
+        #                     (detached), see _forward_common. Stage 1 adds lambda * this.
+        #   'mask_delta'   -- [K], detached: per-part mean |text-matched - classifier| part mass,
+        #                     independent of blend_weight (raw disagreement between the sources).
+        #   'outside_support' -- scalar, detached: fraction of the text-matched mass sitting on
+        #                     (patch, part) cells where the classifier gives that part < 5% --
+        #                     "how much of the text map is outside anatomy".
+        self.last_blend_stats = None
         self._has_global = hasattr(backbone, 'project_global')
         self.num_parts = (2 if self._has_global else 1) + num_parts  # M, matching BPBReIDEncoder's own convention
         self.num_features = self.backbone.embed_dim
@@ -76,13 +96,59 @@ class ClipBPAMEncoder(nn.Module):
             state = torch.load(checkpoint_path, map_location=device)
             self.pixel_classifier.load_state_dict(state['pixel_classifier'] if 'pixel_classifier' in state else state)
 
-    def _forward_common(self, images):
+    def _forward_common(self, images, text_contexts=None, blend_weight=0.0):
+        """text_contexts: optional [B, num_branches, embed_dim] -- this batch's own identities'
+        current per-branch text embeddings in the full branch layout this encoder emits (0 =
+        global/foreground, 1..K = parts[, last = native global]); only the K part rows are read.
+        blend_weight: fraction of each patch's *foreground* mass reassigned by the CLIP-native,
+        text-matched part assignment instead of the pixel classifier's own. Both default to off,
+        which leaves every existing caller (Stage 2/3, the evaluator, the Stage 1 feature cache)
+        bit-identical to before -- the blend block below is skipped entirely."""
         patch_feats = self.backbone(images)  # [B, N, vision_width], raw
         B, N, D = patch_feats.shape
         grid = patch_feats.permute(0, 2, 1).reshape(B, D, self.backbone.grid_h, self.backbone.grid_w)
         pixels_cls_scores = self.pixel_classifier(grid)  # [B, 1+K, grid_h, grid_w]
         num_pixel_classes = 1 + self._k
         probs = F.softmax(pixels_cls_scores, dim=1).reshape(B, num_pixel_classes, N).permute(0, 2, 1)  # [B,N,1+K]
+
+        if text_contexts is not None and blend_weight > 0.0:
+            # probs' channel 0 is BACKGROUND (PixelToPartClassifier's own layout), while
+            # text_contexts' row 0 is the global/foreground branch -- the two "index 0"s are not
+            # the same thing, and no text context describes background at all. So the CLIP-native
+            # assignment is a softmax over the K part contexts only, and it redistributes just the
+            # classifier's foreground mass (1 - background) among the parts: background stays
+            # exactly as the classifier says, every patch still sums to 1, and downstream
+            # (parts_masks / foreground_masks / visibility) reads the blended probs unchanged.
+            part_ctx = text_contexts[:, 1:1 + self._k, :]  # [B, K, embed_dim]
+            dense_feats = self.backbone.project_dense(patch_feats)  # [B, N, embed_dim], attention-free
+            clip_parts = clip_native_part_masks(dense_feats, part_ctx, self.mask_temperature)  # [B, N, K]
+            background = probs[:, :, :1]
+            classifier_parts = probs[:, :, 1:]
+            foreground_mass = 1.0 - background
+            blended_parts = (1.0 - blend_weight) * classifier_parts + blend_weight * foreground_mass * clip_parts
+            probs = torch.cat([background, blended_parts], dim=-1)
+
+            # Anatomical anchor for the text-matched assignment. Nothing in Stage 1's objective
+            # says WHERE part k is except the Stage-0 classifier: SupCon rewards pooling
+            # identity-discriminative patches, which are the same patches for every k, so left
+            # alone the K text maps have a standing incentive to converge on the same region.
+            # Reverse KL, text || classifier-conditional-on-foreground (detached): mode-seeking,
+            # so the text map may sharpen freely INSIDE the classifier's region for part k (the
+            # refinement the blend exists for) and pays only when its mass lands where the
+            # classifier says that part isn't. Foreground-weighted -- background is the
+            # classifier's alone and the text softmax over K parts is undefined there.
+            cls_cond = (classifier_parts / foreground_mass.clamp(min=1e-6)).detach().clamp(min=1e-4)
+            per_patch_kl = (clip_parts * (clip_parts.clamp(min=1e-8).log() - cls_cond.log())).sum(-1)  # [B, N]
+            fg_w = foreground_mass.squeeze(-1).detach()
+            anchor_loss = (fg_w * per_patch_kl).sum() / fg_w.sum().clamp(min=1e-6)
+            with torch.no_grad():
+                outside = (clip_parts * (cls_cond < 0.05).float()).sum(-1)  # [B, N]
+                self.last_blend_stats = {
+                    'anchor_loss': None,  # filled below, outside no_grad
+                    'mask_delta': (foreground_mass * clip_parts - classifier_parts).abs().mean(dim=(0, 1)),
+                    'outside_support': (fg_w * outside).sum() / fg_w.sum().clamp(min=1e-6),
+                }
+            self.last_blend_stats['anchor_loss'] = anchor_loss
 
         # project_all() (RN50 only) shares ONE attnpool call between the per-patch and global
         # outputs -- calling project()/project_global() separately here would silently recompute
@@ -123,9 +189,9 @@ class ClipBPAMEncoder(nn.Module):
 
         return f_out, vis, pixels_cls_scores
 
-    def forward(self, images):
-        f_out, vis, _ = self._forward_common(images)
+    def forward(self, images, text_contexts=None, blend_weight=0.0):
+        f_out, vis, _ = self._forward_common(images, text_contexts, blend_weight)
         return f_out, vis
 
-    def forward_full(self, images):
-        return self._forward_common(images)
+    def forward_full(self, images, text_contexts=None, blend_weight=0.0):
+        return self._forward_common(images, text_contexts, blend_weight)

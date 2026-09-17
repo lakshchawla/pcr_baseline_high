@@ -125,11 +125,20 @@ def main():
     num_branches = (2 if has_global_branch else 1) + num_parts
 
     text_encoder = ClipTextEncoder(clip_arch=cfg.clip.arch, device='cuda').cuda()
+    prompt_learner_path = osp.join(cfg.logging.logs_dir, 'prompt_learner.pth')
+    prompt_state = load_checkpoint(prompt_learner_path)
+    # Checkpoints trained before TextualAttentionBlock got its zero-init gate have no `tab.gate`
+    # key and were trained with the ungated (full-replacement) output, which the gated form
+    # can't represent -- replay them with the block built the way they were trained.
+    tab_gated = 'tab.gate' in prompt_state
+    if not tab_gated:
+        print('==> {} predates the gated TextualAttentionBlock -- replaying it ungated'.format(
+            prompt_learner_path))
     prompt_learner = PromptLearner(num_identities, num_parts, text_encoder, n_ctx=cfg.clip.n_ctx,
                                     tab_num_heads=cfg.tab.num_heads, tab_num_layers=cfg.tab.num_layers,
-                                    device='cuda', has_global_branch=has_global_branch).cuda()
-    prompt_learner_path = osp.join(cfg.logging.logs_dir, 'prompt_learner.pth')
-    prompt_learner.load_state_dict(load_checkpoint(prompt_learner_path))
+                                    device='cuda', has_global_branch=has_global_branch,
+                                    tab_gated=tab_gated).cuda()
+    prompt_learner.load_state_dict(prompt_state)
     print('==> Loaded {}'.format(prompt_learner_path))
 
     identity_visibility_path = osp.join(cfg.logging.logs_dir, 'identity_visibility.pth')

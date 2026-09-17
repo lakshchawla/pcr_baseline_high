@@ -2550,3 +2550,115 @@ full eval pass, `align` loss sitting at ~33 (matching `ln(751)*5`, the expected 
 short a run, not a red flag).
 
 Full repo `python -m py_compile` sweep clean.
+
+### 2026-09-17 -- CLIP-native (MaskCLIP-style) part masks matched against live Stage 1 contexts
+
+Implements `plans/agent_plan_clip_native_part_masks.md`. Additive: every existing call path
+(Stage 2/3, evaluator, Stage 1's feature cache) is bit-identical to before -- verified directly
+against the pre-change `ClipBPAMEncoder` class, not assumed.
+
+**Mechanism**: `ClipRN50DenseBackbone.project_dense()` = `c_proj(v_proj(patch))` per patch --
+MaskCLIP's attention-free dense projection (no query/key/softmax, no mean token, no positional
+embedding), so it's independent of `_attnpool_forward()` entirely. `ClipViTDenseBackbone` gets
+the same method name (its `project()` is already a per-token affine map, so it just aliases).
+`pcr/models/clip_native_masks.py::clip_native_part_masks` softmaxes each patch's cosine
+similarity against its OWN identity's current part contexts (per-sample gather, not one shared
+template). `ClipBPAMEncoder._forward_common(images, text_contexts=None, blend_weight=0.0)`
+blends that assignment into the pixel classifier's `probs` before any pooling/visibility.
+
+**Deviation from the plan, deliberate**: the plan blends `clip_mask [B,N,1+K]` straight over
+`probs [B,N,1+K]` as if both had branch 0 first. They don't: `probs[:,:,0]` is *background*
+(`PixelToPartClassifier`'s layout), while text row 0 is the global/foreground context, and no
+text context describes background at all. Blending them index-for-index would have pushed the
+foreground context's similarity into the background channel. Instead: softmax over the K part
+contexts only, and the result redistributes just the classifier's *foreground* mass
+(`1 - background`) among the parts -- `parts = (1-b)*cls_parts + b*(1-bg)*clip_parts`,
+background untouched, every patch still sums to 1. Text row 0 and the native-global row are
+never read.
+
+**Stage 1 wiring** (`examples/train_relational_prompts.py`): Stage 1 trains on *cached*
+features (frozen encoder, one pass), so there was no per-iteration encoder call to pass contexts
+into. Once the blend weight is > 0, each epoch's PK batches are replayed as an image loader
+(`get_batch_image_loader`, `batch_sampler=` over the same index lists, same test transform as
+the cache pass) and the batch is re-run live through the frozen encoder -- not under `no_grad`,
+since the mask blend is the one path by which gradient reaches `ctx`/TAB from the image side.
+All M branch texts are now built up front (needed before the image side can run), and the
+in-batch images' live feature rows are spliced over their cached ones for t2i, mirroring what i2t
+already did for in-batch text rows. `relalign_schedule` generalized to `ramp_schedule` and
+shared with the new `clip_native_mask` config block. Each epoch logs the blend weight applied
+and per-part mean `|blended - classifier|` mass (`encoder.last_clip_mask_delta`).
+
+**Verified** (synthetic, CPU + one GPU step; scratch script, not committed): `project_dense`
+shape/finiteness/cross-patch variance; the mask function separates two engineered regions
+(>0.99 confidence) and stays diffuse (<0.5) for the other identity's contexts on the same
+image; default path bit-identical to the pre-change class for no-args, `text_contexts` with
+`blend_weight=0`, and `None` with `blend_weight=0.3`; blend path changes `f_out`, leaves the
+native-global branch and `pixels_cls_scores` untouched, blended probs sum to 1 with background
+preserved, gradient reaches the K part context rows and *only* those; full GPU chain
+`PromptLearner -> ClipTextEncoder -> encoder(blend) -> apply_vab_with_pooling -> SupConLoss`
+with text detached puts non-zero gradient on `prompt_learner.ctx` (i.e. through the masks alone).
+`ramp_schedule` and the PK-order image replay checked too. Full-repo `py_compile` sweep clean.
+
+**Not run: a real Stage 1 epoch.** The committed `ClipRN50DenseBackbone._attnpool_forward` has
+`query=x[:1]`, so `project()`/`project_all()` return `[B, 0, embed_dim]` and
+`ClipBPAMEncoder.forward` raises at `_gwap_pool` on the very first image (reproduced on CPU with
+the RN50 weights). The plan scopes that method out ("bug included, until that's fixed
+separately"), so it's untouched here; the gates above monkeypatch an every-location-query
+stand-in for `project_all` to get past it. Stage 0/1/2 cannot run end-to-end until that's
+resolved.
+
+### 2026-09-17 (2) -- TAB gated; within-identity part contrast; mask anchor; relalign renormalized
+
+**Measured first, on the fully-trained Stage 1 checkpoint from 2026-09-16** (pre-blend baseline,
+ungated TAB; CPU replay of `prompt_learner.pth` + `identity_visibility.pth`):
+
+- TAB-mixed ctx per-token norm **34.5** vs 0.50 for the learnable ctx and 0.37 for CLIP's own
+  token embeddings around it -- the learnable ctx was numerically irrelevant to the prompt.
+- TAB branch-to-branch attention mean diagonal 0.131 vs 0.143 uniform -- near-uniform mixing.
+- **Same-identity, different-part text cosine 0.982** (same-part different-identity: 0.26).
+  The part prompts carried identity and essentially no part -- collapsed into one identity
+  vector per person, through TAB. SupCon cannot see this (its negatives are cross-identity).
+- Live confirmation from the blend run in progress at the time: `mask delta/part` flat to the
+  third decimal from the first blend epoch (41) through 86 while beta ramped 0.06 -> 0.30 --
+  five near-identical contexts give a fixed, diffuse text map that neither converges nor
+  diverges. `VAB gate -0.002` after 86 epochs.
+
+**Changes**:
+- `pcr/models/relation_blocks.py::TextualAttentionBlock`: zero-init tanh-gated residual
+  (`ctx + tanh(gate) * (TAB(ctx) - ctx)`), the convention every other block already followed.
+  `gated=False` kept solely for replaying pre-gate checkpoints; `examples/cache_text_anchors.py`
+  detects the missing `tab.gate` key and builds the block accordingly (an ungated output is not
+  representable by the gated form, so a strict load with the wrong variant is the right failure).
+  `pcr/models/prompt_learner.py` threads `tab_gated`.
+- `pcr/loss/part_diag_loss.py` (new): `PartDiagLoss` -- image part k vs the SAME person's K part
+  contexts (positive k, negatives the person's other parts) and the reverse; bare cosine with a
+  fixed temperature, no learned projections (a projection pair could satisfy the diagonal from
+  tensor structure alone without ctx moving, and ctx is the only thing that survives caching).
+  Bounded by 2 log K. `same_identity_part_cosine` is the matching diagnostic. Stage 1 config
+  block `part_diag` (on from epoch 0, ramp 10%, lambda 1.0, T 0.05).
+- `ClipBPAMEncoder._forward_common`: `L_anchor` -- foreground-weighted reverse KL of the
+  text-matched part assignment against the classifier's conditional-on-foreground assignment
+  (detached); mode-seeking, so the text map may sharpen inside part k's region and pays only
+  when mass leaves it. Exposed with the diagnostics through `encoder.last_blend_stats`
+  (`anchor_loss` with grad, `mask_delta` [K], `outside_support` = fraction of text mass where the
+  classifier gives that part < 5%). Stage 1 applies `anchor_weight * (beta / beta_max)`, so it's
+  identically zero whenever the blend is. Replaces the old `last_clip_mask_delta` attribute.
+- `train_relational_prompts.py`: `L_relalign`'s sliced TAB target renormalized per row -- the
+  `[1:1+K, 1:1+K]` sub-block of a row-stochastic matrix sums to < 1 (and train-mode attention
+  dropout sub-normalizes it further), which is why logged values were negative. Gradient direction
+  was already correct; the value is now a real KL. Epoch line adds `part-ctx cos` (the collapse
+  metric; target well below 0.9) and `outside-support`; iteration line adds `TAB gate`,
+  `part_diag`, `anchor`.
+
+**Verified** (CPU; GPU held by the user's live run): gated TAB is bit-identical to ctx at init and
+moves once the gate opens; the 2026-09-16 checkpoint loads strictly with `tab_gated=False`;
+`PartDiagLoss` = log K per direction on collapsed text, ~0 on matched, large on rolled; anchor KL
+is 0 when the text map equals the classifier's and 1.66 with all mass on the least-likely part,
+gradient reaches the K part context rows only; renormalized relalign >= 0 and 0 at match; default
+encoder path still bit-identical to the pre-blend class; one full Stage 1 step (prompt learner ->
+text encoder -> blended encoder -> VAB/pool -> SupCon + relalign + part_diag + anchor) puts
+gradient on ctx, TAB gate and VAB gate. Full-repo `py_compile` clean.
+
+**Not changed (flagged, awaiting a decision)**: visibility is still computed from the blended
+masks, so a text map that force-assigns foreground patches to an occluded part floors that part's
+visibility at ~beta * fg. Fix would be to derive `vis` from the classifier-only probs.
