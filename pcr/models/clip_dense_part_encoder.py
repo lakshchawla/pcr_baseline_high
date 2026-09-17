@@ -86,6 +86,10 @@ class ClipBPAMEncoder(nn.Module):
         #   'outside_support' -- scalar, detached: fraction of the text-matched mass sitting on
         #                     (patch, part) cells where the classifier gives that part < 5% --
         #                     "how much of the text map is outside anatomy".
+        #   'blended_probs' -- [B, N, 1+K], detached: the blended per-patch assignment actually
+        #                     used for pooling -- Stage 1's distillation target for
+        #                     pixel_classifier (so the text-refined localization survives to
+        #                     inference, where there is no text).
         self.last_blend_stats = None
         self._has_global = hasattr(backbone, 'project_global')
         self.num_parts = (2 if self._has_global else 1) + num_parts  # M, matching BPBReIDEncoder's own convention
@@ -96,20 +100,28 @@ class ClipBPAMEncoder(nn.Module):
             state = torch.load(checkpoint_path, map_location=device)
             self.pixel_classifier.load_state_dict(state['pixel_classifier'] if 'pixel_classifier' in state else state)
 
-    def _forward_common(self, images, text_contexts=None, blend_weight=0.0):
+    def _forward_common(self, images, text_contexts=None, blend_weight=0.0, stop_mask_grad=False):
         """text_contexts: optional [B, num_branches, embed_dim] -- this batch's own identities'
         current per-branch text embeddings in the full branch layout this encoder emits (0 =
         global/foreground, 1..K = parts[, last = native global]); only the K part rows are read.
         blend_weight: fraction of each patch's *foreground* mass reassigned by the CLIP-native,
         text-matched part assignment instead of the pixel classifier's own. Both default to off,
         which leaves every existing caller (Stage 2/3, the evaluator, the Stage 1 feature cache)
-        bit-identical to before -- the blend block below is skipped entirely."""
+        bit-identical to before -- the blend block below is skipped entirely.
+        stop_mask_grad: detach the classifier's softmax before it pools anything, so a trainable
+        pixel_classifier receives gradient ONLY through the returned pixels_cls_scores (i.e. from
+        a mask-supervised loss), never through the pooled embeddings' identity losses -- Stage 1
+        uses this so localization is learned from anatomy + the text-refined map, not from
+        identity discrimination (which rewards every part grabbing the same discriminative
+        patches). No-op when the classifier is frozen."""
         patch_feats = self.backbone(images)  # [B, N, vision_width], raw
         B, N, D = patch_feats.shape
         grid = patch_feats.permute(0, 2, 1).reshape(B, D, self.backbone.grid_h, self.backbone.grid_w)
         pixels_cls_scores = self.pixel_classifier(grid)  # [B, 1+K, grid_h, grid_w]
         num_pixel_classes = 1 + self._k
         probs = F.softmax(pixels_cls_scores, dim=1).reshape(B, num_pixel_classes, N).permute(0, 2, 1)  # [B,N,1+K]
+        if stop_mask_grad:
+            probs = probs.detach()
 
         if text_contexts is not None and blend_weight > 0.0:
             # probs' channel 0 is BACKGROUND (PixelToPartClassifier's own layout), while
@@ -147,6 +159,7 @@ class ClipBPAMEncoder(nn.Module):
                     'anchor_loss': None,  # filled below, outside no_grad
                     'mask_delta': (foreground_mass * clip_parts - classifier_parts).abs().mean(dim=(0, 1)),
                     'outside_support': (fg_w * outside).sum() / fg_w.sum().clamp(min=1e-6),
+                    'blended_probs': probs.detach(),
                 }
             self.last_blend_stats['anchor_loss'] = anchor_loss
 
@@ -189,9 +202,9 @@ class ClipBPAMEncoder(nn.Module):
 
         return f_out, vis, pixels_cls_scores
 
-    def forward(self, images, text_contexts=None, blend_weight=0.0):
-        f_out, vis, _ = self._forward_common(images, text_contexts, blend_weight)
+    def forward(self, images, text_contexts=None, blend_weight=0.0, stop_mask_grad=False):
+        f_out, vis, _ = self._forward_common(images, text_contexts, blend_weight, stop_mask_grad)
         return f_out, vis
 
-    def forward_full(self, images, text_contexts=None, blend_weight=0.0):
-        return self._forward_common(images, text_contexts, blend_weight)
+    def forward_full(self, images, text_contexts=None, blend_weight=0.0, stop_mask_grad=False):
+        return self._forward_common(images, text_contexts, blend_weight, stop_mask_grad)

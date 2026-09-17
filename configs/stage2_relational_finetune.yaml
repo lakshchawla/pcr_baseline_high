@@ -6,11 +6,11 @@
 # RN50 checkpoint -- the SAME one Stage 1 used, frozen, as its own starting point (Stage 1
 # never updates it, so this is genuinely "the same weights", not a separate lineage). Unlike
 # BPBreIDEncoder(HRNet32), this backbone's own pretrained weights fine-tune here too (not just
-# BPAM's classifier head) -- Algorithm 2's own intent, and what makes L_align/L_crossalign below
+# BPAM's classifier head) -- Algorithm 2's own intent, and what makes L_align below
 # load-bearing: they're what stops this fine-tuning drifting the backbone out of CLIP's own
 # pretrained joint space. Stage 1's prompts/CLIP text encoder are frozen and never loaded here at
 # all (only the frozen text_prototypes.pth/text_self_attention.pth tables they produced are read,
-# from stage1.prompt_dir). VisualAttentionBlock is *not* frozen -- it continues training here,
+# from stage1.prompt_dir). AttentionPoolingBlock is *not* frozen -- it continues training here,
 # starting from Stage 1's weights (also read from stage1.prompt_dir). See
 # examples/train_relational_finetune.py. Its own build_encoder dispatches on clip.arch below
 # (ViT-* -> ClipViTBPAMEncoder, else -> ClipRN50BPAMEncoder), same convention as Stage 1.
@@ -18,17 +18,21 @@
 # Track A (real global-embedding branch) and Track B (per-identity centroid loss, loss.centroid_*
 # below) are actually being tested, per the real full-run baseline of mAP/R1 = 82.2/91.8.
 #
-# Renamed from stage2_backbone_finetune.yaml -- pairs with the renamed script; the vab: section
+# Renamed from stage2_backbone_finetune.yaml -- pairs with the renamed script; the pool: section
 # below is the new content relative to that file. No visibility: section -- the upstream
 # image-level filter this used to configure was removed (see progress.md's entry on this); every
 # image is used, weighted per-part inside CosineAlignLoss, with a loose hard exclusion for
 # triplet only (loss.triplet_visibility_min, below).
 
 model:
-  # Stage 0's trained pixel-classifier checkpoint for ClipRN50BPAMEncoder (state dict key
-  # 'pixel_classifier') -- the SAME checkpoint Stage 1 used going in, NOT a full BPBreID/ViT
-  # checkpoint and NOT Stage 1's own output (Stage 1 produces no encoder checkpoint at all).
-  checkpoint_path: 'examples/logs/stage0_bpa_rn50/model_best.pth.tar'
+  # pixel_classifier checkpoint for ClipRN50BPAMEncoder (state dict key 'pixel_classifier'):
+  # Stage 1's pixel_classifier.pth -- Stage 0's head, continued in Stage 1 under BPA on real
+  # masks + distillation from the text-refined (blended) part maps, so the localization the
+  # prompts sharpened is what this stage (and retrieval) actually starts from. Always written by
+  # Stage 1 (with the blend off it's just Stage 0's weights again). NOT a full BPBreID/ViT
+  # checkpoint. To bypass the continuation, point this back at
+  # examples/logs/stage0_bpa_rn50/model_best.pth.tar.
+  checkpoint_path: 'examples/logs/stage1_prompts_clip_rn50/pixel_classifier.pth'
   dim_reduce_output: 1024    # RN50's own embed_dim -- must match stage1's model.dim_reduce_output
                               # and clip.arch's text embed dim, both from the SAME CLIP checkpoint
   parts_num: 5
@@ -39,23 +43,17 @@ clip:
 
 stage1:
   # directory produced by examples/train_relational_prompts.py + examples/cache_text_anchors.py --
-  # reads text_prototypes.pth (the frozen alignment target) and vab.pth (VisualAttentionBlock's
+  # reads text_prototypes.pth (the frozen alignment target) and pool.pth (AttentionPoolingBlock's
   # Stage-1-trained starting weights, which this stage continues training) from here
   prompt_dir: examples/logs/stage1_prompts_clip_rn50
 
-vab:
-  num_heads: 4                 # must match stage1's vab.num_heads/num_layers -- these define the
-  num_layers: 1                # architecture vab.pth's weights were trained for
-
-cab:
-  # CrossAttentionBlock: grounds each visual branch against its frozen text prototype before
-  # L_align reads it (see METHODOLOGY.md's Stage 2 / CAB section). L_crossalign ramps in on a
-  # schedule (0 during warmup, linear ramp, then flat) rather than from epoch 0, since CAB starts
-  # as an identity function (gate=0) and needs a few epochs of plain L_align pressure first.
-  num_heads: 4
-  crossalign_warmup_fraction: 0.25
-  crossalign_ramp_fraction: 0.15
-  crossalign_lambda_max: 0.3
+pool:
+  num_heads: 4                 # must match stage1's pool.num_heads -- defines the architecture
+                                # pool.pth's weights were trained for. No vab:/cab: sections any
+                                # more: VisualAttentionBlock (gate never left zero) and
+                                # CrossAttentionBlock (never run at retrieval, so L_align was
+                                # shaping a feature the evaluator never computes) were removed --
+                                # see pcr/models/relation_blocks.py's module docstring.
 
 data:
   dataset: market1501         # or dukemtmc-reid

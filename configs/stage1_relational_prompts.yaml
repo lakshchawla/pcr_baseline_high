@@ -19,13 +19,13 @@
 # pcr/models/clip_dense_part_encoder.py and pcr/models/hm.py) are RN50-only for now (ViT stays on
 # ClipViTBPAMEncoder's own separate configs when it's tested again).
 #
-# CLIP text encoder and this image encoder are both frozen here; only ctx (incl.
-# TextualAttentionBlock) and VisualAttentionBlock train -- see
+# CLIP text encoder and the CLIP backbone are frozen here; ctx (incl. TextualAttentionBlock),
+# the pooling block, and -- while the blend is active -- pixel_classifier train; see
 # examples/train_relational_prompts.py's own docstring for the full Algorithm 1 this file's
 # script now follows exactly. Run examples/cache_text_anchors.py against this same config
 # afterward to build Stage 2's frozen text-prototype table.
 #
-# Renamed from stage1_prompt_learning.yaml -- pairs with the renamed script; the tab:/vab:
+# Renamed from stage1_prompt_learning.yaml -- pairs with the renamed script; the tab:/pool:
 # sections below are the new content relative to that file. No visibility: section -- the
 # upstream image-level filter this used to configure was removed (see progress.md's entry on
 # this); every image is used, weighted per-part inside SupConLoss instead.
@@ -55,24 +55,35 @@ tab:
   num_heads: 4                 # TextualAttentionBlock's attention heads, over all M=1+K branches
   num_layers: 1                # start shallow -- see progress.md for the ablation this should feed
 
-vab:
-  num_heads: 4                 # VisualAttentionBlock's attention heads, over all M=1+K branches
-  num_layers: 1                # start shallow -- see progress.md for the ablation this should feed
+pool:
+  num_heads: 4                 # AttentionPoolingBlock's heads (the global-embedding aggregator
+                                # over the K foreground-gated parts). No vab:/relalign: sections
+                                # any more -- VisualAttentionBlock and L_relalign were removed
+                                # (gate never left zero in two real runs; see
+                                # pcr/models/relation_blocks.py's module docstring).
 
-relalign:
-  # L_relalign: pulls VAB's branch-to-branch attention pattern toward TAB's (detached), guarding
-  # against both blocks converging to degenerate near-identical patterns across branches. Same
-  # warmup/ramp/flat schedule shape as Stage 2's crossalign -- see METHODOLOGY.md.
-  warmup_fraction: 0.3
-  ramp_fraction: 0.2
-  lambda_max: 0.3
+bpam:
+  # BPAM continuation: pixel_classifier keeps training while the blend is active -- BPA on real
+  # PifPaf masks (Stage 0's own loss, continued, same inverse-sqrt-frequency class weights) plus
+  # distillation toward the blended, text-refined part map, so the localization the prompts
+  # sharpened is baked into the text-free classifier that Stage 2 and retrieval actually run.
+  # Gradient reaches the classifier ONLY through these two mask losses (stop_mask_grad), never
+  # through SupCon/part_diag. Saved as pixel_classifier.pth; Stage 2's model.checkpoint_path
+  # points there. Requires data.masks_dir (Market1501 only -- DukeMTMC has no masks).
+  lr: 0.0001                   # 10x below Stage 0's 0.001: this is refinement of a converged
+                                # head, and the target it distils from contains its own output
+  bpa_weight: 1.0
+  distill_weight: 1.0
+  recache_every: 1             # rebuild the full-dataset feature cache every N blend epochs (the
+                                # classifier moved, so cached features/visibility go stale)
+  class_weight_batches: 50     # mask batches sampled to estimate the BPA class weights
 
 clip_native_mask:
   # MaskCLIP-style, text-matched part masks (pcr/models/clip_native_masks.py, blended inside
   # ClipBPAMEncoder._forward_common -- see plans/agent_plan_clip_native_part_masks.md). Each
   # batch's images are matched, patch by patch, against their OWN identity's current K part
   # contexts, and that assignment takes over blend_weight of the pixel classifier's foreground
-  # mass. Same warmup/ramp/flat shape as relalign above, but tuned on its own: contexts mean
+  # mass. Same warmup/ramp/flat shape as part_diag below, but tuned on its own: contexts mean
   # nothing until SupCon has shaped them, so the blend stays off through warmup. blend_weight_max
   # 0 reproduces the pre-blend script exactly (no images are re-read) -- run that first as the
   # regression baseline before comparing against 0.3; don't start higher than 0.3 without first
@@ -107,6 +118,8 @@ data:
   data_dir: ../datasets
   height: 384
   width: 128
+  masks_dir: pifpaf_maskrcnn_filtering   # PifPaf masks for the BPAM continuation (bpam: above);
+  masks_suffix: '.npy'                    # same on-disk layout Stage 0 / Stage 2 read
   batch_size: 32               # PK batch size per SupCon training step (must be a multiple of num_instances)
   num_instances: 4             # PK sampling over the cached feature set: batch_size // num_instances
                                 # identities per batch, num_instances cached images each (with
@@ -138,7 +151,8 @@ logging:
   # Not stage1_prompts (HRNet32/512-dim), stage1_prompts_clip_vit_b16 (ViT-B/16/512-dim), or
   # stage1_prompts_clip_vit_l14 (ViT-L/14/768-dim) -- this dir's prompt_learner.pth/vab.pth are
   # trained against ClipRN50BPAMEncoder/1024-dim (now also a real 7-branch table, see model:
-  # section's comment above) and aren't compatible with any of those.
+  # section's comment above) and aren't compatible with any of those. Also receives
+  # pixel_classifier.pth (the BPAM continuation's output) for Stage 2.
   logs_dir: examples/logs/stage1_prompts_clip_rn50
   print_freq: 10
   seed: 1

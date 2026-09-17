@@ -17,13 +17,14 @@ from pcr.models.clip_rn50_bpam_encoder import ClipRN50BPAMEncoder
 from pcr.models.clip_vit_bpam_encoder import ClipViTBPAMEncoder
 from pcr.models.clip_text_encoder import ClipTextEncoder
 from pcr.models.prompt_learner import PromptLearner
-from pcr.models.relation_blocks import VisualAttentionBlock, AttentionPoolingBlock, apply_vab_with_pooling
+from pcr.models.relation_blocks import AttentionPoolingBlock, apply_part_pooling
+from pcr.loss.body_part_attention_loss import BodyPartAttentionLoss
 from pcr.loss.clip_supcon_loss import SupConLoss
 from pcr.loss.part_diag_loss import PartDiagLoss, same_identity_part_cosine
-from pcr.loss.cross_attn_align_loss import cross_attention_alignment_loss
 from pcr.utils.config import load_yaml_config
 from pcr.utils.data import transforms as T
-from pcr.utils.data.preprocessor import Preprocessor
+from pcr.utils.data.preprocessor import Preprocessor, PreprocessorMaskedSingleView
+from pcr.utils.mask_targets import mask_to_pixel_targets, estimate_class_weights, soft_pixel_distillation
 from pcr.utils.logging import Logger
 from pcr.utils.lr_scheduler import WarmupCosineLR
 from pcr.utils.osutils import mkdir_if_missing
@@ -52,16 +53,22 @@ def get_cache_loader(dataset_list, root, height, width, batch_size, workers):
         batch_size=batch_size, num_workers=workers, shuffle=False, pin_memory=True)
 
 
-def get_batch_image_loader(dataset_list, root, height, width, batches, workers):
-    """Re-reads the images behind this epoch's already-drawn PK batches (build_pk_batches'
-    output, indices into `dataset_list` -- the same sorted list the feature cache was built
-    over, so index i means the same image in both), in that exact batch order, for the live
-    encoder forward the CLIP-native mask blend needs. Same test-time transform as the cache
-    pass: the frozen backbone must see the identical pixels it was cached on, so a blend_weight
-    of 0 reproduces the cached features exactly."""
-    return DataLoader(
-        Preprocessor(dataset_list, root=root, transform=get_test_transform(height, width)),
-        batch_sampler=[b.tolist() for b in batches], num_workers=workers, pin_memory=True)
+def get_batch_image_loader(dataset, train_set, cfg, batches):
+    """Re-reads the images (and their PifPaf masks) behind this epoch's already-drawn PK batches
+    (build_pk_batches' output, indices into `train_set` -- the same sorted list the feature
+    cache was built over, so index i means the same image in both), in that exact batch order,
+    for the live encoder forward the CLIP-native mask blend + BPAM continuation need. Deterministic
+    geometry (pad=0, flip_p=0 -> plain bicubic resize, the same kernel the cache pass's T.Resize
+    uses) and the same CLIP normalization, no photometric augmentation: the frozen backbone must
+    see the identical pixels it was cached on, so a blend weight of 0 reproduces the cached
+    features exactly. Yields (img, mask [1+K, H, W], pid, camid, index)."""
+    photometric = T.Compose([T.ToTensor(), T.Normalize(mean=list(CLIP_MEAN), std=list(CLIP_STD))])
+    wrapper = PreprocessorMaskedSingleView(
+        train_set, masks_root=dataset.dataset_dir, masks_dir=cfg.data.masks_dir,
+        height=cfg.data.height, width=cfg.data.width, photometric_transform=photometric,
+        root=dataset.images_dir, pad=0, flip_p=0.0, mask_suffix=cfg.data.masks_suffix)
+    return DataLoader(wrapper, batch_sampler=[b.tolist() for b in batches],
+                      num_workers=cfg.data.workers, pin_memory=True)
 
 
 def cache_part_features(encoder, data_loader):
@@ -173,9 +180,9 @@ def build_pk_batches(cached_labels, num_instances, batch_size):
 
 def ramp_schedule(epoch, total_epochs, warmup_fraction, ramp_fraction, max_value):
     """0 during warmup, then a linear ramp up to max_value, then flat -- same shape as
-    examples/train_relational_finetune.py's crossalign_schedule. Shared by L_relalign's lambda
-    and the CLIP-native mask blend weight (each with its own config block: the two ramp on
-    independent timescales, so their fractions are never copied from one another)."""
+    Stage 2's bpa_weight_schedule is the other schedule shape in this pipeline. Shared by the
+    CLIP-native mask blend weight and L_part_diag's lambda (each with its own config block: they
+    ramp on independent timescales, so their fractions are never copied from one another)."""
     warmup_end = warmup_fraction * total_epochs
     ramp_end = warmup_end + ramp_fraction * total_epochs
     if epoch < warmup_end:
@@ -203,9 +210,17 @@ def build_encoder(cfg):
                            num_parts=cfg.model.parts_num,
                            checkpoint_path=cfg.model.checkpoint_path or None, device='cuda',
                            mask_temperature=cfg.clip_native_mask.mask_temperature).cuda()
+    # Backbone frozen (already so inside the dense backbone's own __init__); the whole module
+    # stays in eval() so every BatchNorm -- the backbone's and the classifier's own -- keeps its
+    # running statistics fixed. pixel_classifier's affine/conv weights DO train here (the BPAM
+    # continuation: BPA on real masks + distillation from the text-refined map, see main_worker),
+    # starting from the Stage 0 checkpoint, with gradient reaching them only through
+    # pixels_cls_scores (stop_mask_grad) -- never through the pooled embeddings' identity losses.
     encoder.eval()
     for p in encoder.parameters():
         p.requires_grad_(False)
+    for p in encoder.pixel_classifier.parameters():
+        p.requires_grad_(True)
     return encoder
 
 
@@ -252,11 +267,10 @@ def main_worker(cfg, setup_only=False):
     prompt_learner = PromptLearner(num_identities, num_parts, text_encoder, n_ctx=cfg.clip.n_ctx,
                                     tab_num_heads=cfg.tab.num_heads, tab_num_layers=cfg.tab.num_layers,
                                     device='cuda', has_global_branch=has_global_branch).cuda()
-    vab = VisualAttentionBlock(dim=cfg.model.dim_reduce_output, num_heads=cfg.vab.num_heads,
-                               num_layers=cfg.vab.num_layers).cuda()
-    # AttentionPoolingBlock: turns the K (VAB-mixed) part tokens into the global embedding --
-    # replaces foreground's old peer-token role. See relation_blocks.py's own module docstring.
-    pool = AttentionPoolingBlock(dim=cfg.model.dim_reduce_output, num_heads=cfg.vab.num_heads).cuda()
+    # AttentionPoolingBlock: turns the K (foreground-gated) part tokens into the global
+    # embedding -- replaces foreground's old peer-token role. No VAB any more (see
+    # relation_blocks.py's own module docstring for the evidence behind removing it).
+    pool = AttentionPoolingBlock(dim=cfg.model.dim_reduce_output, num_heads=cfg.pool.num_heads).cuda()
 
     train_set = sorted(dataset.train)
     print("==> Caching part-embeddings for the full training set (frozen encoder, single pass, "
@@ -288,13 +302,34 @@ def main_worker(cfg, setup_only=False):
     # Within-identity part contrast -- the negative set SupCon lacks (a person's own other parts).
     # See pcr/loss/part_diag_loss.py for the collapse it exists to prevent.
     part_diag = PartDiagLoss(temperature=cfg.part_diag.temperature).cuda()
-    # ctx (all M=1+K branches, global/foreground included), TextualAttentionBlock
-    # (prompt_learner.tab), VisualAttentionBlock, and SupConLoss's own learnable temperature
-    # (see that file's own docstring) all train.
+    # BPAM continuation (Stage 0 continues inside Stage 1, only while the blend is active): the
+    # pixel classifier keeps training on real PifPaf masks (BPA, same inverse-sqrt-frequency
+    # class weights Stage 0 used) plus a distillation term toward the blended, text-refined
+    # part map -- so the localization the prompts sharpened survives to Stage 2 and retrieval,
+    # where there is no text. Saved as pixel_classifier.pth at the end (Stage 2's
+    # model.checkpoint_path). Class weights are estimated from a few batches of masks, mask
+    # loading only.
+    bpam_cfg = cfg.bpam
+    print('==> Estimating BPA class weights from {} batches of masks'.format(bpam_cfg.class_weight_batches))
+    weight_loader = get_batch_image_loader(dataset, train_set, cfg,
+                                           build_pk_batches(cached_labels, cfg.data.num_instances,
+                                                            cfg.data.batch_size)[:bpam_cfg.class_weight_batches])
+    class_weight, class_freq = estimate_class_weights(
+        (batch[1] for batch in weight_loader), 1 + num_parts,
+        (encoder.backbone.grid_h, encoder.backbone.grid_w), bpam_cfg.class_weight_batches)
+    print('==> BPA class weights {} (pixel freq {})'.format(
+        ['{:.2f}'.format(w) for w in class_weight.tolist()], ['{:.3f}'.format(f) for f in class_freq.tolist()]))
+    bpa_loss = BodyPartAttentionLoss(weight=class_weight.cuda()).cuda()
+
+    # ctx (all M branches, global/foreground included), TextualAttentionBlock (prompt_learner.tab),
+    # the pooling block, and SupConLoss's own learnable temperature (see that file's own
+    # docstring) train at optim.lr; pixel_classifier at its own, lower bpam.lr.
     trainable_params = ([prompt_learner.ctx] + list(prompt_learner.tab.parameters())
-                         + list(vab.parameters()) + list(pool.parameters()) + list(supcon.parameters()))
-    optimizer = torch.optim.Adam(trainable_params, lr=cfg.optim.lr,
-                                  weight_decay=cfg.optim.weight_decay)
+                         + list(pool.parameters()) + list(supcon.parameters()))
+    optimizer = torch.optim.Adam([
+        {'params': trainable_params},
+        {'params': list(encoder.pixel_classifier.parameters()), 'lr': bpam_cfg.lr},
+    ], lr=cfg.optim.lr, weight_decay=cfg.optim.weight_decay)
     scheduler = WarmupCosineLR(optimizer, max_epochs=cfg.optim.epochs,
                                 warmup_epochs=cfg.optim.warmup_epochs,
                                 warmup_lr_init=cfg.optim.warmup_lr_init,
@@ -303,10 +338,12 @@ def main_worker(cfg, setup_only=False):
     # own dtype exactly, see pcr/models/clip_text_encoder.py's docstring), and CLIP-ReID's own
     # stage-1 loop always wraps its backward in a GradScaler to guard against fp16 gradient
     # underflow through the text transformer -- ported faithfully rather than assuming raw fp16
-    # backward is fine. VisualAttentionBlock and PromptLearner's own parameters run in fp32
+    # backward is fine. The pooling block's and PromptLearner's own parameters run in fp32
     # (GradScaler is harmless for fp32 leaves), so one scaler covers everything trainable.
     scaler = torch.amp.GradScaler('cuda')
 
+    classifier_moved = False  # set once the first blend epoch has trained pixel_classifier
+    blend_epochs = 0
     for epoch in range(cfg.optim.epochs):
         # Refresh the full-identity text-anchor snapshot once per epoch, against this epoch's
         # ctx/TAB weights -- see build_text_snapshot's own docstring. Puts prompt_learner in
@@ -315,7 +352,6 @@ def main_worker(cfg, setup_only=False):
         text_snapshot = build_text_snapshot(prompt_learner, text_encoder, num_identities, num_branches,
                                              identity_visibility, cfg.data.cache_batch_size)
         prompt_learner.train()
-        vab.train()
         pool.train()
         epoch_loss = 0.0
         epoch_start = time.time()
@@ -335,8 +371,18 @@ def main_worker(cfg, setup_only=False):
                                      mask_cfg.ramp_fraction, mask_cfg.blend_weight_max)
         blend_active = blend_weight > 0.0
         if blend_active:
-            image_batches = iter(get_batch_image_loader(train_set, dataset.images_dir, cfg.data.height,
-                                                        cfg.data.width, batches, cfg.data.workers))
+            # The classifier has been training since the first blend epoch, so the full-dataset
+            # cache (t2i's comparison pool, and the pre-blend features every batch starts from)
+            # goes stale -- rebuild it every bpam.recache_every blend epochs. identity_visibility
+            # (TAB's per-identity bias) deliberately stays at its epoch-0 value: it's saved and
+            # replayed verbatim by cache_text_anchors.py, so it must be one fixed table.
+            if classifier_moved and blend_epochs % bpam_cfg.recache_every == 0:
+                print('==> Re-caching part-embeddings under the updated pixel_classifier')
+                cached_features, cached_visibility, _ = cache_part_features(encoder, cache_loader)
+                cached_features, cached_visibility = cached_features.cuda(), cached_visibility.cuda()
+            blend_epochs += 1
+            classifier_moved = True
+            image_batches = iter(get_batch_image_loader(dataset, train_set, cfg, batches))
         # Anchor weight scales with the blend weight itself (zero whenever the blend is off, so a
         # blend_weight_max of 0 still reproduces the pre-blend script exactly).
         lambda_anchor = mask_cfg.anchor_weight * (blend_weight / mask_cfg.blend_weight_max
@@ -346,6 +392,8 @@ def main_worker(cfg, setup_only=False):
         mask_delta_sum = torch.zeros(num_parts, device='cuda')
         outside_sum = 0.0
         part_cos_sum = 0.0
+        bpa_sum = 0.0
+        distil_sum = 0.0
 
         for it, b_idx in enumerate(batches):
             b_labels = cached_labels[b_idx]
@@ -360,7 +408,7 @@ def main_worker(cfg, setup_only=False):
             # rows are built up front (not one at a time inside the loss loop below) because the
             # mask blend needs every part's context before the image side can be computed.
             id_vis = identity_visibility[b_labels]  # [b, 1+K], TAB's per-identity bias
-            prompts, A_text = prompt_learner.build_part_prompts(b_labels, id_vis)  # list of 1+K tensors
+            prompts, _ = prompt_learner.build_part_prompts(b_labels, id_vis)  # list of 1+K tensors
             # L2-normalized -- see build_text_snapshot's own comment on why: the visual side is
             # already unit-norm, and SupConLoss's dot product only behaves as a real cosine
             # similarity, matching its own temperature, if both sides are.
@@ -369,15 +417,17 @@ def main_worker(cfg, setup_only=False):
                 for m in range(num_branches)], dim=1)  # [b, 1+K, D], fresh + differentiable
 
             if blend_active:
-                imgs, _, img_pids, _, _ = next(image_batches)
+                imgs, masks, img_pids, _, _ = next(image_batches)
                 assert torch.equal(img_pids.to(b_labels.device), b_labels), \
                     "image loader fell out of step with this epoch's PK batches"
-                # Frozen encoder, but NOT under no_grad: the blend is the one path through which
-                # gradient reaches ctx/TAB from the image side (via the text-matched masks ->
-                # pooled features); the backbone itself contributes no graph (requires_grad off).
-                b_features, b_vis, _ = encoder.forward_full(imgs.cuda(non_blocking=True),
-                                                            text_contexts=branch_texts,
-                                                            blend_weight=blend_weight)
+                # Frozen backbone, but NOT under no_grad: the blend is the path through which
+                # gradient reaches ctx/TAB from the image side (text-matched masks -> pooled
+                # features), and pixels_cls_scores carries the classifier's own gradient (from
+                # the two mask losses below only -- stop_mask_grad keeps the identity losses off
+                # it). The backbone itself contributes no graph (requires_grad off).
+                b_features, b_vis, pixels_cls_scores = encoder.forward_full(
+                    imgs.cuda(non_blocking=True), text_contexts=branch_texts,
+                    blend_weight=blend_weight, stop_mask_grad=True)
                 blend_stats = encoder.last_blend_stats
                 mask_delta_sum += blend_stats['mask_delta']
                 outside_sum += blend_stats['outside_support'].item()
@@ -391,11 +441,10 @@ def main_worker(cfg, setup_only=False):
             else:
                 t2i_features, t2i_labels = cached_features, cached_labels
 
-            # apply_vab_with_pooling (not bare vab()): foreground gates the K parts, VAB mixes the
-            # gated parts only, then pool (AttentionPoolingBlock) aggregates them into a new
-            # global -- see relation_blocks.py's own module docstring. branch_visual keeps the
-            # exact same [b, 1+K, D] shape/layout as before (global at branch 0).
-            branch_visual, A_vis = apply_vab_with_pooling(vab, pool, b_features, b_vis, has_global_branch)
+            # apply_part_pooling: foreground gates the K parts, pool (AttentionPoolingBlock)
+            # aggregates them into the global at branch 0; the parts themselves pass through
+            # untouched -- see relation_blocks.py's own module docstring.
+            branch_visual, _ = apply_part_pooling(pool, b_features, b_vis, has_global_branch)
 
             # Identities NOT in this batch -- their text row comes from this epoch's (detached)
             # snapshot instead of a fresh re-encoding, widening i2t's negative pool to the full
@@ -421,38 +470,15 @@ def main_worker(cfg, setup_only=False):
                 loss = loss + supcon(visual_m, other_text, b_labels, other_text_labels, w_m)
 
                 # t2i: full-dataset classification -- every cached image, not just this batch's,
-                # is a comparison point. The cache never goes stale (backbone/BPAM are frozen for
-                # the whole of Stage 1); only when the mask blend is active do this batch's own
-                # rows get superseded by their live, blended versions (spliced above).
+                # is a comparison point. Before the blend the cache is exact (backbone and
+                # classifier untouched); once the blend is active this batch's own rows are
+                # superseded by their live, blended versions (spliced above) and the whole cache
+                # is rebuilt every bpam.recache_every epochs as the classifier moves.
                 loss = loss + supcon(branch_text, t2i_features[:, m, :], b_labels, t2i_labels, w_m)
-
-            # L_relalign: pushes VAB's own branch-to-branch attention pattern (A_vis, per-image)
-            # toward TAB's (A_text, per-identity, detached -- this loss trains VAB, not TAB) -- a
-            # direct regularizer against both blocks converging to degenerate, near-identical
-            # relational patterns across branches (prompt/branch-embedding collapse), on top of
-            # whatever the SupCon gradient above already does. Ramped in on a schedule since both
-            # blocks' patterns are meaningless before SupCon has shaped them at all.
-            #
-            # A_vis is now [b,K,K] (VAB mixes the K real parts only, see relation_blocks.py's own
-            # module docstring); TAB is untouched by this fork's changes, so A_text is still
-            # [b,1+K,1+K] (foreground included) -- sliced to its own parts-only [1:,1:] sub-block
-            # (both axes, since this is self-attention on both sides) to match shapes.
-            lambda_relalign = ramp_schedule(epoch, cfg.optim.epochs, cfg.relalign.warmup_fraction,
-                                            cfg.relalign.ramp_fraction, cfg.relalign.lambda_max)
-            # Renormalized after slicing: the parts-only sub-block of a row-stochastic [M, M]
-            # matrix has rows summing to < 1 (the global columns' mass is gone), and a KL against
-            # a sub-normalized target reads negative (seen in real logs: relalign ~ -0.2). The
-            # gradient direction was already right (the optimum is the renormalized target
-            # either way); this makes the logged value a real KL >= 0.
-            a_text_target = A_text.detach()[:, 1:1 + num_parts, 1:1 + num_parts]
-            a_text_target = a_text_target / a_text_target.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-            l_relalign = cross_attention_alignment_loss(A_vis, a_text_target)
-            loss = loss + lambda_relalign * l_relalign
 
             # L_part_diag: image part k vs the SAME person's K part contexts (and the reverse) --
             # the within-identity negatives SupCon never sees. Global branches excluded (no
-            # sibling parts to contrast against). Uses the VAB-mixed image parts, i.e. the same
-            # tensor SupCon's i2t reads, so both losses shape the same feature.
+            # sibling parts to contrast against). Reads the same image parts SupCon's i2t does.
             text_parts = branch_texts[:, 1:1 + num_parts, :]
             l_part_diag = part_diag(branch_visual[:, 1:1 + num_parts, :], text_parts,
                                     b_vis[:, 1:1 + num_parts])
@@ -461,8 +487,19 @@ def main_worker(cfg, setup_only=False):
 
             # L_anchor: keeps the text-matched part maps inside the classifier's anatomy while
             # the blend is active -- see ClipBPAMEncoder._forward_common. Zero-cost when off.
+            # BPAM continuation, same epochs: L_bpa pins pixel_classifier to the real PifPaf masks
+            # (Stage 0's own loss, continued), L_distil pulls it toward the blended map that
+            # actually pooled this batch (text-refined, detached) -- see
+            # pcr/utils/mask_targets.py::soft_pixel_distillation for why the pair is stable
+            # without an EMA teacher. Both reach the classifier through pixels_cls_scores only.
             if blend_active:
                 loss = loss + lambda_anchor * blend_stats['anchor_loss']
+                l_bpa, _ = bpa_loss(pixels_cls_scores, mask_to_pixel_targets(masks.cuda(non_blocking=True),
+                                                                             pixels_cls_scores))
+                l_distil = soft_pixel_distillation(pixels_cls_scores, blend_stats['blended_probs'])
+                loss = loss + bpam_cfg.bpa_weight * l_bpa + bpam_cfg.distill_weight * l_distil
+                bpa_sum += l_bpa.item()
+                distil_sum += l_distil.item()
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -470,15 +507,15 @@ def main_worker(cfg, setup_only=False):
             epoch_loss += loss.item()
 
             if (it + 1) % cfg.logging.print_freq == 0:
-                print('Epoch: [{}][{}/{}]\tLoss {:.3f}\tLR {:.2e}\tVAB gate {:.3f}\tTAB gate {:.3f}'
-                      '\tPool gate {:.3f}\trelalign {:.4f} (x{:.2f})\tpart_diag {:.4f} (x{:.2f})'
-                      '\tanchor {} (x{:.3f})'.format(
+                print('Epoch: [{}][{}/{}]\tLoss {:.3f}\tLR {:.2e}\tTAB gate {:.3f}\tPool gate {:.3f}'
+                      '\tpart_diag {:.4f} (x{:.2f})\tanchor {} (x{:.3f})\tbpa {}\tdistil {}'.format(
                     epoch, it + 1, iters_per_epoch, loss.item(), optimizer.param_groups[0]['lr'],
-                    torch.tanh(vab.gate).item(), torch.tanh(prompt_learner.tab.gate).item(),
-                    torch.tanh(pool.gate).item(), l_relalign.item(), lambda_relalign,
+                    torch.tanh(prompt_learner.tab.gate).item(), torch.tanh(pool.gate).item(),
                     l_part_diag.item(), lambda_part_diag,
                     '{:.4f}'.format(blend_stats['anchor_loss'].item()) if blend_active else 'off',
-                    lambda_anchor))
+                    lambda_anchor,
+                    '{:.4f}'.format(l_bpa.item()) if blend_active else 'off',
+                    '{:.4f}'.format(l_distil.item()) if blend_active else 'off'))
 
         scheduler.step()
         # Per-part mean |text-matched - classifier| part mass (independent of the blend weight),
@@ -492,18 +529,26 @@ def main_worker(cfg, setup_only=False):
         # collapsed; 0.98 on the pre-fix checkpoint). outside-support: fraction of the text map's
         # mass the classifier puts at < 5% for that part -- "how much of it is outside anatomy".
         print('Epoch {} done in {:.1f}s, avg loss {:.4f}, SupCon temperature {:.4f}, '
-              'part-ctx cos {:.3f}, clip-mask blend {:.3f}, mask delta/part {}, outside-support {}'.format(
+              'part-ctx cos {:.3f}, clip-mask blend {:.3f}, mask delta/part {}, outside-support {}, '
+              'bpa {}, distil {}'.format(
             epoch, time.time() - epoch_start, epoch_loss / iters_per_epoch, supcon.temperature.item(),
             part_cos_sum / iters_per_epoch, blend_weight,
             None if mask_delta is None else ['{:.4f}'.format(d) for d in mask_delta],
-            '{:.3f}'.format(outside_sum / iters_per_epoch) if blend_active else None))
+            '{:.3f}'.format(outside_sum / iters_per_epoch) if blend_active else None,
+            '{:.4f}'.format(bpa_sum / iters_per_epoch) if blend_active else None,
+            '{:.4f}'.format(distil_sum / iters_per_epoch) if blend_active else None))
 
     torch.save(prompt_learner.state_dict(), osp.join(cfg.logging.logs_dir, 'prompt_learner.pth'))
-    torch.save(vab.state_dict(), osp.join(cfg.logging.logs_dir, 'vab.pth'))
     torch.save(pool.state_dict(), osp.join(cfg.logging.logs_dir, 'pool.pth'))
     torch.save(identity_visibility.cpu(), osp.join(cfg.logging.logs_dir, 'identity_visibility.pth'))
-    print('==> Saved prompt_learner.pth, vab.pth, pool.pth and identity_visibility.pth to {}. Run '
-          'examples/cache_text_anchors.py next to build text_prototypes.pth for Stage 2.'.format(
+    # Same on-disk shape as Stage 0's checkpoint ({'pixel_classifier': state_dict}), so Stage 2's
+    # model.checkpoint_path can point here directly. Always written -- with the blend off the
+    # classifier never moved and this is just Stage 0's weights again.
+    torch.save({'pixel_classifier': encoder.pixel_classifier.state_dict()},
+               osp.join(cfg.logging.logs_dir, 'pixel_classifier.pth'))
+    print('==> Saved prompt_learner.pth, pool.pth, identity_visibility.pth and pixel_classifier.pth '
+          'to {}. Run examples/cache_text_anchors.py next to build text_prototypes.pth for Stage 2, '
+          'and point Stage 2\'s model.checkpoint_path at pixel_classifier.pth.'.format(
               cfg.logging.logs_dir))
 
     end_time = time.monotonic()

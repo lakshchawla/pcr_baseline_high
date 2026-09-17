@@ -61,45 +61,6 @@ def compute_text_prototypes(prompt_learner, text_encoder, num_identities, num_br
     return text_prototypes
 
 
-def compute_text_preproj(prompt_learner, text_encoder, num_identities, num_branches, id_batch,
-                          identity_visibility):
-    """Same loop as compute_text_prototypes above, but calls encode_branch_prepool instead of the
-    text encoder's own forward() -- returns [num_identities, num_branches, transformer_width]
-    (NOT embed_dim -- see ClipTextEncoder.encode_branch_prepool's own docstring), the input
-    compute_text_self_attention below actually needs. Not saved to disk itself (only
-    text_self_attention.pth, built from it, is) -- this table has no other consumer."""
-    prompt_learner.eval()
-    preproj = torch.zeros(num_identities, num_branches, text_encoder.transformer_width,
-                           dtype=torch.float32, device='cuda')
-    with torch.no_grad():
-        for start in range(0, num_identities, id_batch):
-            ids = torch.arange(start, min(start + id_batch, num_identities), device='cuda')
-            branch_vis = identity_visibility[ids]
-            prompts, _ = prompt_learner.build_part_prompts(ids, branch_vis)
-            for branch, prompt in enumerate(prompts):
-                preproj[ids, branch] = text_encoder.encode_branch_prepool(
-                    prompt, prompt_learner.tokenized_prompts).float()
-    return preproj
-
-
-def compute_text_self_attention(text_encoder, text_preproj, id_batch):
-    """text_preproj: [num_identities, num_branches, transformer_width] (compute_text_preproj
-    above). Returns [num_identities, num_branches, num_branches]: each identity's own CLIP
-    text-side self-attention among its branch representations -- CrossAttentionBlock's
-    L_crossalign target in Stage 2 (see pcr/loss/cross_attn_align_loss.py). Precomputed here,
-    once, for the same reason text_prototypes is: prompt_learner/TAB/the text encoder are frozen
-    after Stage 1, so this is a deterministic function of identity alone."""
-    num_identities, num_branches, _ = text_preproj.shape
-    attn_table = torch.zeros(num_identities, num_branches, num_branches,
-                              dtype=torch.float32, device='cuda')
-    with torch.no_grad():
-        for start in range(0, num_identities, id_batch):
-            end = min(start + id_batch, num_identities)
-            attn_table[start:end] = text_encoder.encode_branch_self_attention(
-                text_preproj[start:end]).float()
-    return attn_table
-
-
 def main():
     parser = argparse.ArgumentParser(
         description="Build Stage 2's frozen text-prototype table from a trained Stage-1 checkpoint")
@@ -154,16 +115,6 @@ def main():
     torch.save({'text_prototypes': text_prototypes.cpu(), 'num_identities': num_identities,
                 'num_branches': num_branches}, out_path)
     print('==> Saved {}'.format(out_path))
-
-    print('==> Building text self-attention table for CrossAttentionBlock (Stage 2)')
-    text_preproj = compute_text_preproj(prompt_learner, text_encoder, num_identities, num_branches,
-                                         cfg.data.cache_batch_size, identity_visibility)
-    text_self_attention = compute_text_self_attention(text_encoder, text_preproj,
-                                                        cfg.data.cache_batch_size)
-    attn_path = osp.join(cfg.logging.logs_dir, 'text_self_attention.pth')
-    torch.save({'text_self_attention': text_self_attention.cpu(), 'num_identities': num_identities,
-                'num_branches': num_branches}, attn_path)
-    print('==> Saved {}'.format(attn_path))
 
 
 if __name__ == '__main__':

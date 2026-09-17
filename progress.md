@@ -2662,3 +2662,45 @@ gradient on ctx, TAB gate and VAB gate. Full-repo `py_compile` clean.
 **Not changed (flagged, awaiting a decision)**: visibility is still computed from the blended
 masks, so a text map that force-assigns foreground patches to an occluded part floors that part's
 visibility at ~beta * fg. Fix would be to derive `vis` from the classifier-only probs.
+
+### 2026-09-17 (3) -- BPAM continuation with distillation in Stage 1; VAB and CAB removed
+
+**Removed**: `VisualAttentionBlock`, `CrossAttentionBlock`, `apply_vab_with_pooling`,
+`L_relalign` (Stage 1), `L_crossalign` + `text_self_attention.pth` (Stage 2 / cache_text_anchors),
+`pcr/loss/cross_attn_align_loss.py`, config sections `vab:`/`relalign:`/`cab:` (replaced by
+`pool:`). Evidence: VAB's gate at -0.002 after 86 Stage 1 epochs and 0.000 after 58 Stage 2
+epochs -- the objective never used it, and mixing the K pooled part tokens is exactly the
+part-specificity erosion L_part_diag penalizes; CAB's gate did open (-0.46) but CAB never runs at
+retrieval, so L_align was shaping a feature the evaluator never computes. Image side is now
+masks -> GWAP parts -> foreground gating -> `AttentionPoolingBlock` for branch 0
+(`apply_part_pooling`); parts are never mixed with each other. `Evaluator(model, pool=None)`,
+`extract_features(model, loader, pool=None)` -- Stage 3's keyword usage unaffected.
+
+**Added -- Stage 0 continues inside Stage 1** (`bpam:` config block, `pcr/utils/mask_targets.py`):
+while the blend is active, `pixel_classifier` trains at its own lower LR on (a) `L_bpa` against
+real PifPaf masks with Stage 0's inverse-sqrt-frequency class weights (re-estimated at startup
+from 50 mask batches) and (b) `L_distil`, soft cross-entropy toward the blended, text-refined
+per-patch map that actually pooled the batch (`encoder.last_blend_stats['blended_probs']`,
+detached). The classifier gets gradient ONLY through `pixels_cls_scores`
+(`stop_mask_grad=True` detaches its softmax from the pooled features), never from
+SupCon/part_diag -- localization is learned from anatomy + text, not identity discrimination.
+The batch loader now returns masks too (`PreprocessorMaskedSingleView` with pad=0/flip_p=0 --
+verified pixel-identical to the cache transform on real Market1501 images). The full-dataset
+cache is rebuilt every `bpam.recache_every` blend epochs; `identity_visibility` stays at its
+epoch-0 value (it's replayed verbatim by cache_text_anchors.py). Saved as `pixel_classifier.pth`
+({'pixel_classifier': ...}, Stage 0's on-disk shape); Stage 2's `model.checkpoint_path` now points
+there. No EMA teacher: the target's self-part contributes zero gradient at the optimum and BPA is
+the external anchor (see soft_pixel_distillation's docstring).
+
+**Verified** (CPU; GPU held by a live run): apply_part_pooling layouts (parts and native global
+pass through bit-exact, branch 0 = visibility-weighted mean at gate 0); stop_mask_grad blocks
+identity-loss gradient to the classifier completely and only that flag does; distillation gives
+~0 gradient against the classifier's own map and real gradient toward the blended one; masked
+loader on real data keeps PK order, sums masks to 1, matches the cache transform exactly; class
+weights sum to 1+K with background dominant (freq 0.47); evaluator with pool only; a full CPU
+Stage 1 step (SupCon + part_diag + anchor + bpa + distil) puts finite gradient on ctx, TAB gate,
+pool gate and pixel_classifier. Both earlier gate suites re-pass. Full-repo `py_compile` clean.
+**Not yet run**: `--setup-only` for Stage 1/2 and a 1-epoch smoke (GPU occupied) -- do both before
+a real run; Stage 2 additionally needs a Stage 1 dir that contains `pixel_classifier.pth`.
+
+CLAUDE.md rewritten for the current architecture.

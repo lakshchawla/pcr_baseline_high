@@ -1,7 +1,7 @@
 """BNNeck (Luo et al., "Bag of Tricks and a Strong Baseline for Deep Person Re-identification",
 CVPRW 2019) -- one BatchNorm1d per branch, inserted between the pooled feature (combined, built in
 examples/train_relational_finetune.py::compute_losses from BPBreIDEncoder's global embedding +
-VisualAttentionBlock's mixed part embeddings) and whichever loss needs a differently-shaped
+AttentionPoolingBlock's pooled branch embeddings) and whichever loss needs a differently-shaped
 version of it.
 
 The problem this solves: without it, Stage 2's triplet loss and its ID/align losses all read the
@@ -22,8 +22,8 @@ a learnable BN shift is redundant with it, and BoT's own ablation found leaving 
 left untouched (still has its own bias) -- that's a separate, additional detail from BoT's full
 recipe, not needed for the specific triplet-vs-id/align interference this module fixes.
 
-Scope note, updated after Evaluator was later fixed to apply VisualAttentionBlock at test time
-too (pcr/evaluators.py::Evaluator(encoder, vab)): BoT's own paper also recommends using the
+Scope note, updated after Evaluator was later fixed to apply the pooling block at test time
+too (pcr/evaluators.py::Evaluator(encoder, pool)): BoT's own paper also recommends using the
 *post*-BN feature for retrieval, not just at training time, since the BN-normalized space is
 empirically more discriminative for retrieval too. That part is still not wired in -- the
 Evaluator now reads VAB-mixed `combined` directly, not this module's post-BN version of it -- a

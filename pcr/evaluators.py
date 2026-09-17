@@ -5,29 +5,28 @@ from collections import OrderedDict
 import torch
 
 from .evaluation_metrics import cmc, mean_ap
-from .models.relation_blocks import apply_vab_with_pooling
+from .models.relation_blocks import apply_part_pooling
 from .utils.meters import AverageMeter
 from .utils.part_distance import compute_bpb_pairwise_distance
 
 
-def extract_part_features(model, inputs, vab=None, pool=None):
-    """f_out is optionally mixed/pooled by VAB+AttentionPoolingBlock before being cached -- both
-    need only this image's own real per-branch visibility (no label, no text), so they're fully
-    computable at test time, unlike CrossAttentionBlock (CAB, see Evaluator's own docstring for
-    why CAB can't run here at all). vis itself is left untouched: it's BPBreID's own visibility
-    output, unaffected by VAB/pool's mixing, and compute_bpb_pairwise_distance still needs the
-    real per-branch visibility for its masking."""
+def extract_part_features(model, inputs, pool=None):
+    """f_out is optionally re-pooled by AttentionPoolingBlock before being cached (the global
+    branch becomes the pooling block's output over the foreground-gated parts, see
+    apply_part_pooling) -- it needs only this image's own real per-branch visibility (no label,
+    no text), so it's fully computable at test time. vis itself is left untouched: it's the
+    encoder's own visibility output, and compute_bpb_pairwise_distance still needs the real
+    per-branch visibility for its masking."""
     inputs = inputs.cuda()
     f_out, vis = model(inputs)
-    if vab is not None:
-        f_out, _ = apply_vab_with_pooling(vab, pool, f_out, vis, getattr(model, '_has_global', False))
+    if pool is not None:
+        f_out, _ = apply_part_pooling(pool, f_out, vis, getattr(model, '_has_global', False))
     return f_out.data.cpu(), vis.data.cpu()
 
 
-def extract_features(model, data_loader, vab=None, pool=None, print_freq=50):
+def extract_features(model, data_loader, pool=None, print_freq=50):
     model.eval()
-    if vab is not None:
-        vab.eval()
+    if pool is not None:
         pool.eval()
     batch_time = AverageMeter()
     data_time = AverageMeter()
@@ -41,7 +40,7 @@ def extract_features(model, data_loader, vab=None, pool=None, print_freq=50):
         for i, (imgs, fnames, pids, _, _) in enumerate(data_loader):
             data_time.update(time.time() - end)
 
-            f_out, vis = extract_part_features(model, imgs, vab, pool)
+            f_out, vis = extract_part_features(model, imgs, pool)
             for fname, emb, v, pid in zip(fnames, f_out, vis, pids):
                 features[fname] = emb
                 visibilities[fname] = v
@@ -114,31 +113,25 @@ def evaluate_all(query_features, gallery_features, distmat, query=None, gallery=
 
 
 class Evaluator(object):
-    """vab/pool: optional VisualAttentionBlock + AttentionPoolingBlock, same live instances the
-    caller is training (pass both None for Stage 3/UDA and USL, whose encoders never use VAB/
-    pool/CAB at all -- their behavior is unchanged either way). When given, retrieval features
-    are VAB-mixed and attention-pooled exactly like apply_vab_with_pooling does in training --
-    otherwise Stage 2 would train on those features but evaluate on BPBreID's raw, unmixed output.
+    """pool: optional AttentionPoolingBlock, the same live instance the caller is training (pass
+    None for Stage 3/UDA and USL, whose encoders never use it -- their behavior is unchanged
+    either way). When given, retrieval features are attention-pooled exactly like
+    apply_part_pooling does in training -- otherwise Stage 2 would train on those features but
+    evaluate on the encoder's raw foreground-pooled global.
 
-    CrossAttentionBlock (CAB) is deliberately never applied here, and this is not an oversight:
-    CAB's forward call needs `text_prototypes[targets]`, i.e. the batch's ground-truth identity
-    label, to fetch its text context. At retrieval time that label is exactly the value being
-    inferred -- it isn't known -- and even if it were, `text_prototypes` is sized for the
-    training identity set only (751 for Market1501), which is disjoint from query/gallery
-    identities under the standard evaluation protocol, so there's no row to index even in
-    principle. CAB is a training-time cross-modal grounding regularizer: its effect on retrieval
-    is already baked into VAB/pool/the backbone's learned weights via the gradient it shapes
-    during training, not something applied again at inference.
+    Nothing text-side runs here: retrieval has no identity label to fetch a text context with
+    (and the training identity set is disjoint from query/gallery anyway). Everything the text
+    side contributed -- the prompts' alignment, the text-refined masks distilled into
+    pixel_classifier in Stage 1 -- is already baked into the weights the encoder runs with.
     """
 
-    def __init__(self, model, vab=None, pool=None):
+    def __init__(self, model, pool=None):
         super(Evaluator, self).__init__()
         self.model = model
-        self.vab = vab
         self.pool = pool
 
     def evaluate(self, data_loader, query, gallery, cmc_flag=False):
-        features, visibilities, _ = extract_features(self.model, data_loader, self.vab, self.pool)
+        features, visibilities, _ = extract_features(self.model, data_loader, self.pool)
         distmat, query_features, gallery_features = pairwise_distance(features, visibilities, query, gallery)
         return evaluate_all(query_features, gallery_features, distmat,
                              query=query, gallery=gallery, cmc_flag=cmc_flag)

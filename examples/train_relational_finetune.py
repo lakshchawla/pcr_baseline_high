@@ -4,11 +4,13 @@ correspondence to that algorithm's own names:
 
   Algorithm 2 name           This file / pcr/models
   -----------------          -----------------------
-  backbone + BPAM             BPBReIDEncoder, now trainable, initialized from Stage 0's converged
-                               checkpoint (the SAME one Stage 1 used going in, since Stage 1 never
-                               updates it -- see configs/stage2_relational_finetune.yaml)
-  VRB                         VisualAttentionBlock, now trainable, initialized from vab.pth
-                               (Stage 1's trained starting point, read from stage1.prompt_dir)
+  backbone + BPAM             ClipBPAMEncoder, now trainable; pixel_classifier initialized from
+                               Stage 1's pixel_classifier.pth (Stage 0's head, continued in Stage 1
+                               under BPA + distillation from the text-refined masks -- see
+                               configs/stage2_relational_finetune.yaml's model.checkpoint_path)
+  VRB                         AttentionPoolingBlock (global aggregator over the foreground-gated
+                               parts), trainable, initialized from Stage 1's pool.pth. No VAB/CAB
+                               any more -- see pcr/models/relation_blocks.py's module docstring.
   frozen_text_anchors          text_prototypes.pth (built by examples/cache_text_anchors.py),
                                loaded once; ctx_params/TRB/CLIP text encoder are never loaded
                                here at all -- nothing to "discard", they simply aren't imported
@@ -78,19 +80,18 @@ upstream image-level filter Stage 1/2 both used to run (pcr/utils/visibility_fil
 see progress.md's entry on this change) before either stage's training set was ever built: that
 filter discarded 61% of Market1501's training images in practice, was the wrong granularity (an
 image with 4 good parts and 1 occluded one lost all 4), and was found to be driven by an
-undertrained BPAM signal rather than genuine occlusion. VisualAttentionBlock is also now
+undertrained BPAM signal rather than genuine occlusion. AttentionPoolingBlock is also
 visibility-aware at the attention level itself (see pcr/models/relation_blocks.py's own docstring):
-this forward pass's own vis is passed into vab() as a soft attention-score bias, so a
-poorly-visible branch contributes less as a key to every other branch's post-attention
-representation, not just less to its own downstream loss term.
+this forward pass's own vis is passed in as a soft attention-score bias, so a poorly-visible part
+contributes less to the pooled global, not just less to its own downstream loss term.
 
-End-of-training checkpoint (Algorithm 2 step 20) bundles VisualAttentionBlock's and PartBNNecks'
-state into the SAME saved dict as the encoder's own state ('vab_state_dict'/'bn_necks_state_dict'
+End-of-training checkpoint (Algorithm 2 step 20) bundles AttentionPoolingBlock's and PartBNNecks'
+state into the SAME saved dict as the encoder's own state ('pool_state_dict'/'bn_necks_state_dict'
 alongside 'state_dict'), rather than separate files -- one checkpoint containing {backbone, BPAM,
-VRB, BNNeck}, directly loadable by the existing examples/train_uda.py --checkpoint-path /
+pool, BNNeck}, directly loadable by the existing examples/train_uda.py --checkpoint-path /
 examples/train_usl.py --checkpoint-path unchanged (both only ever read the 'state_dict' key,
 ignoring the rest -- confirmed against bpbreid's own load_pretrained_weights). Stage 3 stays
-completely out of this file's scope otherwise; nothing downstream reads 'vab_state_dict' or
+completely out of this file's scope otherwise; nothing downstream reads 'pool_state_dict' or
 'bn_necks_state_dict' yet.
 
 Renamed from train_finetune.py -- paired with train_relational_prompts.py's rename.
@@ -121,10 +122,8 @@ from pcr.models.clip_vit_bpam_encoder import ClipViTBPAMEncoder
 from pcr.models.bn_neck import PartBNNecks
 from pcr.models.hm import PartHybridMemory
 from pcr.models.id_classifier import PartIdClassifiers
-from pcr.models.relation_blocks import (VisualAttentionBlock, CrossAttentionBlock,
-                                         AttentionPoolingBlock, apply_vab_with_pooling)
-from pcr.loss import (PartTripletLoss, CrossEntropyLabelSmooth, CosineAlignLoss, BodyPartAttentionLoss,
-                       cross_attention_alignment_loss)
+from pcr.models.relation_blocks import AttentionPoolingBlock, apply_part_pooling
+from pcr.loss import (PartTripletLoss, CrossEntropyLabelSmooth, CosineAlignLoss, BodyPartAttentionLoss)
 from pcr.evaluators import Evaluator, extract_features
 from pcr.utils.config import load_yaml_config
 from pcr.utils.data import IterLoader
@@ -197,15 +196,15 @@ def get_test_loader(dataset, height, width, batch_size, workers, testset=None):
 def build_encoder(cfg):
     # ClipRN50BPAMEncoder / ClipViTBPAMEncoder (dispatched on cfg.clip.arch, same convention as
     # Stage 1's own build_encoder -- must agree with Stage 1 exactly, see that file's comment on
-    # why), not BPBreIDEncoder(HRNet32) -- must be initialized from the SAME Stage 0 checkpoint
-    # Stage 1 used going in (see this file's own module docstring's "backbone + BPAM" row), so
-    # text_prototypes.pth/text_self_attention.pth describe a part convention this encoder
-    # actually starts from. Visibility is continuous by construction (softmax attention maps, no
-    # binary mode) -- no config knob needed here, unlike BPBReIDModelCfg's training/
-    # testing_binary_visibility_score. Unfrozen (per Algorithm 2's own intent): CLIP's pretrained
-    # weights fine-tune here too, which is exactly what makes L_align/L_crossalign below
-    # load-bearing rather than decorative -- they're what stops this fine-tuning drifting the
-    # backbone out of CLIP's own joint space.
+    # why), not BPBreIDEncoder(HRNet32) -- must be initialized from the pixel_classifier Stage 1
+    # ENDED with (pixel_classifier.pth: Stage 0's head continued under BPA + distillation from
+    # the text-refined masks; see this file's own module docstring's "backbone + BPAM" row), so
+    # text_prototypes.pth describes a part convention this encoder actually starts from.
+    # Visibility is continuous by construction (softmax attention maps, no binary mode) -- no
+    # config knob needed here, unlike BPBReIDModelCfg's training/testing_binary_visibility_score.
+    # Unfrozen (per Algorithm 2's own intent): CLIP's pretrained weights fine-tune here too,
+    # which is exactly what makes L_align below load-bearing rather than decorative -- it's what
+    # stops this fine-tuning drifting the backbone out of CLIP's own joint space.
     encoder_cls = ClipViTBPAMEncoder if cfg.clip.arch.startswith('ViT') else ClipRN50BPAMEncoder
     encoder = encoder_cls(clip_arch=cfg.clip.arch, height=cfg.data.height, width=cfg.data.width,
                            num_parts=cfg.model.parts_num,
@@ -272,15 +271,15 @@ def _llrd_param_groups(named_params, base_lr, num_depths, depth_fn, weight_decay
     return groups
 
 
-def build_optimizer(encoder, id_classifiers, vab, pool, bn_necks, cab_i2t, cfg):
+def build_optimizer(encoder, id_classifiers, pool, bn_necks, cfg):
     """RN50/HRNet32: unchanged, single flat param list at one LR/WD -- see _llrd_param_groups'
     own docstring for why this stays untouched. ViT: layer-wise LR decay across the backbone's 24
     blocks (+patch-embed stage +final projection), decay/no-decay split everywhere, and every
-    task-specific head (pixel_classifier, id_classifiers, vab, pool, bn_necks, cab_i2t -- none of
-    which have a pretrained "depth" of their own) at the backbone's full, undecayed LR."""
+    task-specific head (pixel_classifier, id_classifiers, pool, bn_necks -- none of which have a
+    pretrained "depth" of their own) at the backbone's full, undecayed LR."""
     if not cfg.clip.arch.startswith('ViT'):
-        params = (list(encoder.parameters()) + list(id_classifiers.parameters()) + list(vab.parameters())
-                  + list(pool.parameters()) + list(bn_necks.parameters()) + list(cab_i2t.parameters()))
+        params = (list(encoder.parameters()) + list(id_classifiers.parameters())
+                  + list(pool.parameters()) + list(bn_necks.parameters()))
         return torch.optim.Adam(params, lr=cfg.optim.lr, weight_decay=cfg.optim.weight_decay)
 
     num_blocks = len(encoder.backbone.resblocks)
@@ -291,7 +290,7 @@ def build_optimizer(encoder, id_classifiers, vab, pool, bn_necks, cab_i2t, cfg):
         lambda n: _vit_backbone_depth(n, num_blocks), cfg.optim.weight_decay, decay_rate)
 
     head_named_params = []
-    for i, m in enumerate([encoder.pixel_classifier, id_classifiers, vab, pool, bn_necks, cab_i2t]):
+    for i, m in enumerate([encoder.pixel_classifier, id_classifiers, pool, bn_necks]):
         head_named_params.extend(('head{}.{}'.format(i, n), p) for n, p in m.named_parameters())
     groups += _llrd_param_groups(head_named_params, cfg.optim.lr, 1, lambda n: 0,
                                   cfg.optim.weight_decay, decay_rate)
@@ -307,18 +306,6 @@ def bpa_weight_schedule(epoch, initial, floor, decay_epochs):
     return floor + 0.5 * (initial - floor) * (1 + math.cos(math.pi * progress))
 
 
-def crossalign_schedule(epoch, total_epochs, cab_cfg):
-    """0 during warmup, then a linear ramp up to crossalign_lambda_max, then flat."""
-    warmup_end = cab_cfg.crossalign_warmup_fraction * total_epochs
-    ramp_end = warmup_end + cab_cfg.crossalign_ramp_fraction * total_epochs
-    if epoch < warmup_end:
-        return 0.0
-    if epoch >= ramp_end:
-        return cab_cfg.crossalign_lambda_max
-    progress = (epoch - warmup_end) / (ramp_end - warmup_end)
-    return cab_cfg.crossalign_lambda_max * progress
-
-
 def mask_to_pixel_targets(mask, pixels_cls_scores):
     """mask: [B, 1+parts_num, H, W] (soft, sums to 1 per pixel). Resized to pixels_cls_scores'
     spatial size and argmax'd into an integer target per pixel -- matches bpbreid's own
@@ -327,8 +314,8 @@ def mask_to_pixel_targets(mask, pixels_cls_scores):
     return mask.argmax(dim=1)
 
 
-def compute_losses(encoder, vab, pool, cab_i2t, bn_necks, id_classifiers, triplet_loss, id_loss,
-                    align_loss, bpa_loss, part_memory, text_prototypes, text_self_attention, imgs,
+def compute_losses(encoder, pool, bn_necks, id_classifiers, triplet_loss, id_loss,
+                    align_loss, bpa_loss, part_memory, text_prototypes, imgs,
                     mask, targets, cfg, epoch):
     use_masks = bpa_loss is not None
     if use_masks:
@@ -337,22 +324,14 @@ def compute_losses(encoder, vab, pool, cab_i2t, bn_necks, id_classifiers, triple
         f_out, vis = encoder(imgs)
         pixels_cls_scores = None
 
-    # apply_vab_with_pooling (not bare vab()): foreground gates the K parts, VAB relationally
-    # mixes the gated parts only, then pool (AttentionPoolingBlock) aggregates them into a new
-    # global embedding taking over branch 0's exact slot -- see relation_blocks.py's own module
-    # docstring. vis is this same forward pass's own per-branch visibility, used both as the gate
-    # and as VAB/pool's attention bias -- unlike Stage 1, no separate per-identity table is
-    # needed here: a real, fresh per-image signal is always available. VAB's own attention
-    # pattern (L_relalign's consumer, Stage 1 only) isn't used here.
-    combined, _ = apply_vab_with_pooling(vab, pool, f_out, vis, encoder._has_global)  # [B, 1+K, D]
+    # apply_part_pooling: foreground gates the K parts, pool (AttentionPoolingBlock) aggregates
+    # them into a new global embedding taking over branch 0's exact slot; the parts pass through
+    # untouched -- see relation_blocks.py's own module docstring (no VAB, no CAB any more: VAB's
+    # gate never left zero, and CAB shaped a feature retrieval never computes). vis is this same
+    # forward pass's own per-branch visibility, used both as the gate and as pool's attention
+    # bias.
+    combined, _ = apply_part_pooling(pool, f_out, vis, encoder._has_global)  # [B, 1+K, D]
     num_branches = combined.size(1)
-
-    # CrossAttentionBlock (CAB): grounds the visual branches against this identity's own frozen
-    # text prototypes (see METHODOLOGY.md's Stage 2 / CAB section). `prompt_feats` needs no live
-    # CLIP forward pass -- text_prototypes is already the exact per-branch table Stage 1 produced,
-    # indexed by this batch's real identity labels.
-    prompt_feats = text_prototypes[targets]  # [B, 1+K, D]
-    vis_grounded, A_cross_i2t = cab_i2t(combined, prompt_feats)
 
     # vis shares combined's exact branch axis (0=foreground, 1..K=parts) -- both are built from
     # the same encoder call. Loose hard exclusion for triplet's batch-hard mining only (soft
@@ -407,25 +386,14 @@ def compute_losses(encoder, vab, pool, cab_i2t, bn_necks, id_classifiers, triple
                                                              # negatives this loss classifies against
         w = vis[:, branch]  # continuous weighting, not the boolean vis_mask used for triplet
         # BNNeck again: align_loss reads the post-BN feature too (triplet, above, still reads
-        # combined directly). Reads vis_grounded (CAB's output), not combined -- CAB is what
-        # grounds this branch against text before align_loss compares it to the prototype table.
-        # Re-normalized after BN -- BatchNorm1d's own per-dimension scaling doesn't preserve the
-        # unit-norm assumption CosineAlignLoss's fixed-temperature softmax depends on, so this
-        # restores it (see bn_neck.py's own docstring).
-        bn_part = F.normalize(bn_necks(vis_grounded, branch), p=2, dim=-1)
+        # combined directly). Reads `combined` -- the exact representation retrieval computes
+        # (no CAB in between any more). Re-normalized after BN -- BatchNorm1d's own per-dimension
+        # scaling doesn't preserve the unit-norm assumption CosineAlignLoss's fixed-temperature
+        # softmax depends on, so this restores it (see bn_neck.py's own docstring).
+        bn_part = F.normalize(bn_necks(combined, branch), p=2, dim=-1)
         align_total = align_total + align_loss(bn_part, branch_prototypes, targets, weights=w)
     total = total + cfg.loss.align_weight * align_total
     log['align'] = align_total.item()
-
-    # L_crossalign: CAB's own image-queries-text attention pattern should look like CLIP's real
-    # internal text self-attention for this identity -- a regularizer keeping CAB's grounding
-    # meaningful rather than an arbitrary learned reweighting. Ramped in on a schedule (see
-    # crossalign_schedule) since CAB starts as an identity function (gate=0) and benefits from a
-    # few epochs of plain L_align pressure first.
-    lambda_crossalign = crossalign_schedule(epoch, cfg.optim.epochs, cfg.cab)
-    l_crossalign = cross_attention_alignment_loss(A_cross_i2t, text_self_attention[targets])
-    total = total + lambda_crossalign * l_crossalign
-    log['crossalign'] = l_crossalign.item()
 
     # L_centroid: PartHybridMemory (pcr/models/hm.py), SPCL's own per-slot momentum-updated
     # memory + full-table softmax classification, reused here with num_samples=num_identities and
@@ -497,25 +465,14 @@ def main_worker(cfg, setup_only=False):
         .format(proto['num_branches'], num_branches, cfg.model.parts_num, has_global_branch))
     text_prototypes = proto['text_prototypes'].cuda()  # [num_identities, num_branches, D]
 
-    attn_path = osp.join(cfg.stage1.prompt_dir, 'text_self_attention.pth')
-    text_self_attention = load_checkpoint(attn_path)['text_self_attention'].cuda()  # [num_identities, num_branches, num_branches]
-
     encoder = build_encoder(cfg)
     id_classifiers = PartIdClassifiers(num_identities, cfg.model.dim_reduce_output, branches=(0,)).cuda()
     bn_necks = PartBNNecks(num_branches, cfg.model.dim_reduce_output).cuda()
 
-    vab = VisualAttentionBlock(dim=cfg.model.dim_reduce_output, num_heads=cfg.vab.num_heads,
-                               num_layers=cfg.vab.num_layers).cuda()
-    vab_path = osp.join(cfg.stage1.prompt_dir, 'vab.pth')
-    vab.load_state_dict(load_checkpoint(vab_path))
-    print('==> Loaded Stage 1 VisualAttentionBlock weights from {}'.format(vab_path))
-
-    pool = AttentionPoolingBlock(dim=cfg.model.dim_reduce_output, num_heads=cfg.vab.num_heads).cuda()
+    pool = AttentionPoolingBlock(dim=cfg.model.dim_reduce_output, num_heads=cfg.pool.num_heads).cuda()
     pool_path = osp.join(cfg.stage1.prompt_dir, 'pool.pth')
     pool.load_state_dict(load_checkpoint(pool_path))
     print('==> Loaded Stage 1 AttentionPoolingBlock weights from {}'.format(pool_path))
-
-    cab_i2t = CrossAttentionBlock(dim=cfg.model.dim_reduce_output, num_heads=cfg.cab.num_heads).cuda()
 
     triplet_loss = PartTripletLoss(margin=cfg.loss.triplet_margin).cuda()
     id_loss = CrossEntropyLabelSmooth(num_identities).cuda()
@@ -554,14 +511,13 @@ def main_worker(cfg, setup_only=False):
     # Mirrors examples/train_uda.py's own "source-domain class centroid" initialization
     # (visibility-weighted mean per identity, with a plain-mean fallback for any branch with zero
     # visible members for that identity) -- a real, already-used pattern in this codebase, not new
-    # logic. Uses encoder/vab exactly as Stage 0/1 left them, before Stage 2's own training loop
+    # logic. Uses encoder/pool exactly as Stage 1 left them, before Stage 2's own training loop
     # (and its optimizer, built below) has taken a single step.
     print('==> Initializing per-identity centroids in part_memory')
     encoder.eval()
-    vab.eval()
     init_loader = get_test_loader(dataset, cfg.data.height, cfg.data.width, cfg.data.batch_size,
                                    cfg.data.workers, testset=train_set)
-    init_features, init_vis, _ = extract_features(encoder, init_loader, vab, pool)
+    init_features, init_vis, _ = extract_features(encoder, init_loader, pool)
     fea_dict = collections.defaultdict(list)
     vis_dict = collections.defaultdict(list)
     for fname, pid, _ in train_set:
@@ -579,7 +535,7 @@ def main_worker(cfg, setup_only=False):
     del init_loader, init_features, init_vis, fea_dict, vis_dict, centers
     print('==> part_memory initialized for {} identities'.format(num_identities))
 
-    optimizer = build_optimizer(encoder, id_classifiers, vab, pool, bn_necks, cab_i2t, cfg)
+    optimizer = build_optimizer(encoder, id_classifiers, pool, bn_necks, cfg)
     # BoT's own recommended schedule (Luo et al., CVPRW 2019) -- linear warmup for
     # cfg.optim.warmup_epochs (default 10), starting from cfg.optim.warmup_factor x the base LR,
     # then the same step decay this file used before (a single drop by 10x at cfg.optim.step_size)
@@ -597,22 +553,17 @@ def main_worker(cfg, setup_only=False):
     lr_scheduler = WarmupMultiStepLR(optimizer, milestones=[cfg.optim.step_size], gamma=0.1,
                                       warmup_factor=cfg.optim.warmup_factor,
                                       warmup_iters=warmup_epochs, warmup_method='linear')
-    # Passing vab (not just encoder): Stage 2's own losses train against VAB-mixed features
-    # (compute_losses' `combined`), so retrieval must use the same representation -- otherwise
-    # the model is evaluated on a representation none of its losses ever optimized. This is a
-    # live reference, same pattern as `encoder` above: in-loop weight updates are reflected
+    # Passing pool (not just encoder): Stage 2's own losses train against attention-pooled
+    # features (compute_losses' `combined`), so retrieval must use the same representation. This
+    # is a live reference, same pattern as `encoder` above: in-loop weight updates are reflected
     # automatically at every periodic evaluator.evaluate() call below, no extra wiring needed.
-    # CAB is deliberately not passed -- see Evaluator's own docstring (pcr/evaluators.py) for why
-    # it can't run at inference at all (needs the ground-truth identity to index text_prototypes).
-    evaluator = Evaluator(encoder, vab, pool)
+    evaluator = Evaluator(encoder, pool)
 
     best_mAP = 0
     for epoch in range(cfg.optim.epochs):
         encoder.train()
-        vab.train()
         pool.train()
         bn_necks.train()
-        cab_i2t.train()
         train_loader.new_epoch()
         train_iters = len(train_loader)
 
@@ -628,16 +579,15 @@ def main_worker(cfg, setup_only=False):
             targets = targets.cuda()
 
             optimizer.zero_grad()
-            loss, log = compute_losses(encoder, vab, pool, cab_i2t, bn_necks, id_classifiers, triplet_loss,
+            loss, log = compute_losses(encoder, pool, bn_necks, id_classifiers, triplet_loss,
                                         id_loss, align_loss, bpa_loss, part_memory, text_prototypes,
-                                        text_self_attention, imgs, mask, targets, cfg, epoch)
+                                        imgs, mask, targets, cfg, epoch)
             loss.backward()
             optimizer.step()
 
             if (it + 1) % cfg.logging.print_freq == 0:
-                print('Epoch: [{}][{}/{}]\tLoss {:.3f}\tVAB gate {:.3f}\tPool gate {:.3f}\tCAB gate {:.3f}\t{}'.format(
-                    epoch, it + 1, train_iters, loss.item(), torch.tanh(vab.gate).item(),
-                    torch.tanh(pool.gate).item(), torch.tanh(cab_i2t.gate).item(),
+                print('Epoch: [{}][{}/{}]\tLoss {:.3f}\tPool gate {:.3f}\t{}'.format(
+                    epoch, it + 1, train_iters, loss.item(), torch.tanh(pool.gate).item(),
                     '\t'.join('{} {:.3f}'.format(k, v) for k, v in log.items())))
 
         lr_scheduler.step()
@@ -656,9 +606,9 @@ def main_worker(cfg, setup_only=False):
             mAP = float(evaluator.evaluate(test_loader, dataset.query, dataset.gallery, cmc_flag=False))
             is_best = mAP > best_mAP
             best_mAP = max(mAP, best_mAP)
-            # Algorithm 2 step 20: one saved checkpoint containing {backbone, BPAM, VRB} -- 'vab_
-            # state_dict' rides alongside 'state_dict' in the same file rather than a separate
-            # vab.pth. 'state_dict' is now encoder.state_dict() directly (the whole
+            # Algorithm 2 step 20: one saved checkpoint containing {backbone, BPAM, pool, BN
+            # necks} -- 'pool_state_dict' rides alongside 'state_dict' in the same file rather
+            # than a separate pool.pth. 'state_dict' is now encoder.state_dict() directly (the whole
             # ClipBPAMEncoder -- backbone + pixel_classifier), not encoder.model.state_dict():
             # unlike BPBReIDEncoder, this class has no inner .model, it IS the top-level module.
             # This is a deliberate, scoped format change -- Stage 3 (train_uda.py/train_usl.py
@@ -666,10 +616,8 @@ def main_worker(cfg, setup_only=False):
             # checkpoint, so nothing existing depends on the old format here.
             save_checkpoint({
                 'state_dict': encoder.state_dict(),
-                'vab_state_dict': vab.state_dict(),
                 'pool_state_dict': pool.state_dict(),
                 'bn_necks_state_dict': bn_necks.state_dict(),
-                'cab_i2t_state_dict': cab_i2t.state_dict(),
                 'epoch': epoch + 1,
                 'best_mAP': best_mAP,
                 'optimizer': optimizer.state_dict(),
@@ -682,10 +630,9 @@ def main_worker(cfg, setup_only=False):
     if osp.isfile(best_fpath):
         checkpoint = load_checkpoint(best_fpath)
         encoder.load_state_dict(checkpoint['state_dict'])
-        # Reload vab/pool's best-epoch weights too -- without this, the final report would combine
-        # the best epoch's encoder with whatever epoch training happened to end on for vab/pool,
-        # which is not what "best model" means now that the evaluator reads VAB-mixed, pooled features.
-        vab.load_state_dict(checkpoint['vab_state_dict'])
+        # Reload pool's best-epoch weights too -- without this, the final report would combine
+        # the best epoch's encoder with whatever epoch training happened to end on for pool,
+        # which is not what "best model" means now that the evaluator reads pooled features.
         pool.load_state_dict(checkpoint['pool_state_dict'])
     else:
         print('No model_best.pth.tar in {}, testing with the final model'.format(cfg.logging.logs_dir))

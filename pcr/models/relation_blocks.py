@@ -1,34 +1,25 @@
-"""Relational attention across a person's branches, on both the visual side
-(VisualAttentionBlock, over BPBreID's pooled branch features) and the text side
-(TextualAttentionBlock, over PromptLearner's per-branch learnable context tokens), plus
-cross-modal grounding (CrossAttentionBlock).
+"""Relational attention on the text side (TextualAttentionBlock, over PromptLearner's per-branch
+learnable context tokens) plus the image side's global aggregator (AttentionPoolingBlock).
 
-Architecture note (this fork, `pcr_attn`): global/foreground is no longer a peer token inside
-self-attention. Two changes, applied together via `apply_vab_with_pooling` below:
+Architecture note (2026-09-17, this fork): the image-side self-attention block
+(`VisualAttentionBlock`, VAB) and the Stage-2 cross-attention block (`CrossAttentionBlock`, CAB)
+are gone. Evidence from the two real runs: VAB's zero-init gate sat at -0.002 after 86 Stage 1
+epochs and 0.000 after 58 Stage 2 epochs -- the objective never found a reason to mix the K
+pooled part tokens, and mixing them is exactly the part-specificity erosion L_part_diag now
+penalizes. CAB's gate did open (-0.46 in Stage 2) but CAB is never run at retrieval (it needs
+the ground-truth identity to fetch its text context), so Stage 2's align loss was shaping a
+feature the evaluator never computes. The image side is now: masks -> GWAP-pooled parts ->
+foreground-gated -> `AttentionPoolingBlock` for the global; the only text/image attention left is
+patch-level, inside ClipBPAMEncoder (the CLIP-native mask blend), which is what actually carries
+spatial information. See progress.md's 2026-09-17 entries.
 
-  1. Foreground is a coarse "how much of this part is real foreground, not background" signal,
-     not a semantic region on the same footing as "torso" or "legs" -- there's no meaningful
-     content for a part to attend to when the "other token" is just a confidence score. It now
-     GATES each of the K real part tokens multiplicatively (`part_tokens[k] *= visibility[k]`)
-     before they enter attention at all, instead of sitting inside the self-attention set as a
-     6th token competing for attention weight against real body parts. (Reuses the per-part
-     visibility this encoder already computes rather than inventing a separate "foreground
-     confidence" signal -- BPBreID's own pixel classifier already derives both from the same
-     foreground-vs-background distinction.)
-  2. The "global" embedding is no longer a separately hand-pooled branch -- it's now the output
-     of AttentionPoolingBlock, a Set-Transformer/PMA-style single-learnable-query attention pool
-     over the (gated, relationally-mixed) K part tokens. A visibility-biased *learned* weighting
-     of which parts matter most for this specific image is a strictly better aggregator than a
-     fixed stack/mean, and it reuses the same visibility signal used everywhere else in this file.
-
-VisualAttentionBlock itself is now self-attention among the K real parts ONLY (no foreground/
-global peer) -- everything else about it (visibility-biased attention logits, zero-init gate,
-L2-normalized output) is unchanged. TextualAttentionBlock (text side) is untouched by this fork's
-changes; only the visual pipeline's aggregation was rearchitected.
-
-Both self-attention blocks stay visibility-aware exactly as before: a poorly-visible key
-contributes less to every other key's post-attention representation, closing the contamination
-gap loss-level weighting alone can't reach.
+Foreground is a coarse "how much of this part is real foreground, not background" signal, not a
+semantic region: it GATES each of the K part tokens multiplicatively (`part_tokens[k] *=
+visibility[k]`) before pooling, reusing the per-part visibility the encoder already computes.
+The "global" embedding is `AttentionPoolingBlock`'s output -- a Set-Transformer/PMA-style
+single-learnable-query attention pool over the gated part tokens, visibility-biased -- and takes
+over branch 0's exact slot (`apply_part_pooling` below), so every downstream consumer
+(id_classifiers, bn_necks, the per-branch loss loops) indexes branches exactly as before.
 """
 import torch
 import torch.nn as nn
@@ -45,7 +36,7 @@ import torch.nn.functional as F
 # combination of eval() mode and a real, non-uniform mask breaks. Disabling this fast path globally
 # is the documented way around it (torch.backends.mha docs); this module is the only place in this
 # repo that builds an nn.TransformerEncoder, so there's no other fast-path user to slow down, and
-# both blocks here are tiny (K=5 tokens) where the fused kernel's speed advantage is negligible
+# the block here is tiny (M*n_ctx tokens) where the fused kernel's speed advantage is negligible
 # next to correctness.
 torch.backends.mha.set_fastpath_enabled(False)
 
@@ -68,7 +59,7 @@ def _replay_with_attention(encoder, x, mask):
     """Manually replays a norm_first nn.TransformerEncoder's own layers with need_weights=True --
     nn.TransformerEncoderLayer.forward always discards attention weights (need_weights=False,
     hardcoded in its _sa_block). Returns (output, last layer's attention [B, L, L], heads
-    averaged) -- both VAB and TAB use single-layer encoders today, so "last layer" is the only
+    averaged) -- TAB uses a single-layer encoder today, so "last layer" is the only
     layer; a deeper stack would only expose its final layer's pattern this way."""
     attn = None
     for layer in encoder.layers:
@@ -80,61 +71,8 @@ def _replay_with_attention(encoder, x, mask):
     return x, attn
 
 
-class VisualAttentionBlock(nn.Module):
-    """Bidirectional self-attention over the K real part features ONLY (image side) -- no
-    foreground/global peer token (see this module's own docstring for why; apply_vab_with_pooling
-    below gates parts by visibility before they ever reach here). Permanent inference-time module:
-    trained in Stage 1 (backbone/BPAM frozen, this is one of the few trainable things), then
-    carried over and continues training in Stage 2 (jointly with the now-unfrozen backbone) --
-    never discarded, unlike TextualAttentionBlock.
-
-    A learned, zero-initialized residual gate keeps this a no-op at initialization
-    (`tanh(0) == 0`, so `forward` returns `part_tokens` unchanged the moment training starts) and
-    doubles as a training-stability/interpretability device: the converged value of
-    `torch.tanh(self.gate)` is a direct read on how much relational mixing training actually
-    found useful for this run -- a gate that stays near 0 is a real (negative) result, not a bug.
-    The visibility-aware attention bias below doesn't disturb this: at gate=0, `relation_out`'s
-    value (masked or not) is multiplied by zero either way.
-
-    Output is L2-normalized before returning (see changes.md's now-resolved entry on this): the
-    residual sum above can drift away from unit norm as the gate moves off zero, but every
-    consumer of this output (SupConLoss in Stage 1, PartTripletLoss/CosineAlignLoss in Stage 2)
-    computes similarity assuming unit-normalized inputs -- matching BPBreIDEncoder's own
-    foreground/global embedding, which is already normalized before this block ever sees the part
-    embeddings. Normalizing here, once, means every caller gets a consistent invariant rather than
-    each loss call site needing to remember it separately. Doesn't change the zero-init no-op
-    property: at gate=0 this returns `normalize(part_tokens)`, and `part_tokens` arrives already
-    unit-normalized from BPBreIDEncoder, so it's a true no-op (up to floating-point precision),
-    not just an approximate one.
-    """
-
-    def __init__(self, dim, num_heads=4, num_layers=1, ff_dim=None):
-        super(VisualAttentionBlock, self).__init__()
-        ff_dim = ff_dim or dim * 2
-        layer = nn.TransformerEncoderLayer(
-            d_model=dim, nhead=num_heads, dim_feedforward=ff_dim,
-            batch_first=True, norm_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers)
-        self.gate = nn.Parameter(torch.zeros(1))
-        self.num_heads = num_heads
-
-    def forward(self, branch_tokens, branch_visibility):
-        """branch_tokens: [B, K, C], the K real part features (gated by visibility already, see
-        apply_vab_with_pooling). branch_visibility: [B, K], that same image's own per-part
-        visibility score (same order as branch_tokens) -- used as a soft attention bias so a
-        poorly-visible part's near-garbage feature contributes less as a key to every other
-        part's post-attention representation. Returns (mixed [B, K, C], attn [B, K, K]) -- mixed
-        is relationally mixed and L2-normalized; attn is this call's own self-attention pattern
-        (see train_relational_prompts.py's L_relalign, which is the only current consumer)."""
-        attn_bias = _visibility_attn_bias(branch_visibility, self.num_heads)
-        relation_out, attn = _replay_with_attention(self.encoder, branch_tokens, attn_bias)
-        mixed = branch_tokens + torch.tanh(self.gate) * relation_out
-        return F.normalize(mixed, p=2, dim=-1), attn
-
-
 class AttentionPoolingBlock(nn.Module):
-    """Set-to-vector aggregation over the K (relationally-mixed) part tokens: a single learnable
+    """Set-to-vector aggregation over the K (foreground-gated) part tokens: a single learnable
     seed query attends over the part set and the resulting weighted sum becomes the "global"
     embedding -- Pooling by Multi-Head Attention (Set Transformer; the same mechanism CoCa and
     Perceiver use to compress a variable token set into one vector). Strictly better fit than a
@@ -142,14 +80,14 @@ class AttentionPoolingBlock(nn.Module):
     torso-heavy when legs are occluded) instead of treating every part as equally important
     regardless of visibility or discriminativeness.
 
-    Visibility-biased exactly like VisualAttentionBlock's own self-attention
+    Visibility-biased exactly like TextualAttentionBlock's own self-attention
     (_visibility_attn_bias): a low-visibility part contributes less as a key/value to the pooled
     result, automatically shifting the summary toward whichever parts are actually trustworthy
     for this image.
 
     Zero-init tanh gate: at init, `forward` returns the plain visibility-weighted mean of the
     part tokens (not an arbitrary random pooled vector) -- a safe, sane starting point that
-    training only deviates from once it finds a reason to, same convention as VAB/CAB's own
+    training only deviates from once it finds a reason to, same convention as TAB's own
     zero-init gates elsewhere in this file."""
 
     def __init__(self, dim, num_heads=4):
@@ -184,21 +122,19 @@ class AttentionPoolingBlock(nn.Module):
         return F.normalize(pooled, p=2, dim=-1), attn.mean(dim=1).squeeze(1)
 
 
-def apply_vab_with_pooling(vab, pool, f_out, vis, has_global):
-    """Replaces the old "VAB mixes all M branches as peers" pipeline: foreground gates the K
-    parts, VAB relationally mixes the (gated) parts only, then `pool` (AttentionPoolingBlock)
-    aggregates the mixed parts into a new global embedding -- which takes over branch 0's exact
-    position (every downstream consumer -- id_classifiers, bn_necks, the per-branch triplet/align
-    loops -- keeps indexing branch 0 as "the global anchor" unchanged).
+def apply_part_pooling(pool, f_out, vis, has_global):
+    """Foreground gates the K parts, `pool` (AttentionPoolingBlock) aggregates the gated parts
+    into the global embedding, which takes over branch 0's exact position; the K part tokens
+    pass through untouched (no cross-part mixing -- see this module's docstring for why VAB was
+    removed). Replaces the old `apply_vab_with_pooling`.
 
-    f_out/vis: [B, M, D]/[B, M], BPBreID's own branch order (0=foreground, 1..K=parts, and a real
-    CLIP-native global appended last iff has_global -- see clip_dense_part_encoder.py). That
-    native global branch, when present, is passed through completely unchanged: it's CLIP's own
-    pretrained whole-image embedding, unrelated to the part-pooling this function replaces.
+    f_out/vis: [B, M, D]/[B, M], the encoder's own branch order (0=foreground, 1..K=parts, and a
+    real CLIP-native global appended last iff has_global -- see clip_dense_part_encoder.py). That
+    native global branch, when present, is passed through completely unchanged.
 
-    Returns (combined [B, M, D], attn [B, K, K]): combined has the exact same shape/branch layout
-    as the old vab(f_out, vis) call it replaces, so no downstream code needs to change; attn is
-    VAB's own relational pattern among the K parts (L_relalign's consumer, Stage 1 only)."""
+    Returns (combined [B, M, D], pool_attn [B, K]): combined has the exact same shape/branch
+    layout as f_out; pool_attn is the pooling block's own visibility-biased weighting over the K
+    parts (diagnostic)."""
     foreground_end = 1
     parts_end = foreground_end + (f_out.size(1) - foreground_end - (1 if has_global else 0))
     part_tokens = f_out[:, foreground_end:parts_end, :]
@@ -208,15 +144,13 @@ def apply_vab_with_pooling(vab, pool, f_out, vis, has_global):
     # reuses each part's own visibility, already derived from the same foreground-vs-background
     # pixel classifier that would otherwise feed a separate "foreground" branch.
     gated_parts = part_tokens * part_vis.unsqueeze(-1)
+    global_pooled, pool_attn = pool(gated_parts, part_vis)
 
-    mixed_parts, attn = vab(gated_parts, part_vis)
-    global_pooled, _ = pool(mixed_parts, part_vis)
-
-    pieces = [global_pooled.unsqueeze(1), mixed_parts]
+    pieces = [global_pooled.unsqueeze(1), part_tokens]
     if has_global:
         pieces.append(f_out[:, -1:, :])
     combined = torch.cat(pieces, dim=1)
-    return combined, attn
+    return combined, pool_attn
 
 
 class TextualAttentionBlock(nn.Module):
@@ -272,12 +206,9 @@ class TextualAttentionBlock(nn.Module):
         branch-to-branch summary: summed over each key branch's own n_ctx tokens (each query row
         sums to 1 over the full M*n_ctx keys, so summing -- not averaging -- a key block preserves
         that row's total probability mass), then averaged over each query branch's own n_ctx rows
-        (a mean of several valid distributions is itself a valid distribution). Needed as a real
-        probability distribution, each row summing to 1, since L_relalign
-        (train_relational_prompts.py) feeds this into a KL divergence against VAB's native
-        [B, M, M] -- naively averaging over both axes (as a purely-visual heatmap wouldn't need to
-        care about) leaves each row summing to 1/n_ctx instead, silently breaking KL's
-        non-negativity."""
+        (a mean of several valid distributions is itself a valid distribution). Kept as a real
+        per-row probability distribution (diagnostic only now that L_relalign, its former consumer,
+        went with VAB; in train() mode attention dropout leaves rows summing to ~1, not exactly)."""
         M = branch_visibility.size(1)
         token_visibility = branch_visibility.repeat_interleave(self.n_ctx, dim=1)  # [B, M*n_ctx]
         attn_bias = _visibility_attn_bias(token_visibility, self.num_heads)
@@ -294,65 +225,3 @@ class TextualAttentionBlock(nn.Module):
         return mixed, attn
 
 
-class CrossAttentionBlock(nn.Module):
-    """Multi-head cross-attention: `query_tokens` attends to `context_tokens` from the other
-    modality. Tanh-gated, zero-init residual (starts as an identity function). See
-    METHODOLOGY.md's Stage 2 / CAB section for how this is used.
-
-    Two deviations from a generic cross-attention block (this fork, `pcr_attn`), both aimed at
-    the same failure mode -- every part's query collapsing onto whichever text token is
-    generically most useful (e.g. the branch with the strongest average signal) instead of its
-    own matched counterpart:
-
-    1. Cosine-normalized logits with a learnable temperature (Swin-V2's "scaled cosine
-       attention"), not raw scaled dot-product on unnormalized embeddings. CLIP's own pretraining
-       compares image/text purely via normalized cosine similarity, temperature-scaled -- a raw
-       QK^T/sqrt(d) on unnormalized vectors introduces a norm-dependence CLIP's weights were never
-       calibrated for. `log_logit_scale` follows CLIP's own `logit_scale` convention.
-    2. A learnable scalar diagonal bias on the attention logits (only when Nq == Nk, i.e. query
-       branch i and context branch i are the same real branch), initialized positive so query i
-       starts with a preference for context i -- its own matched branch -- while training is
-       free to loosen or even reverse it wherever real cross-talk helps."""
-
-    def __init__(self, dim, num_heads=4, diag_init=2.0):
-        super(CrossAttentionBlock, self).__init__()
-        assert dim % num_heads == 0, "dim must be divisible by num_heads"
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.q_proj = nn.Linear(dim, dim)
-        self.k_proj = nn.Linear(dim, dim)
-        self.v_proj = nn.Linear(dim, dim)
-        self.out_proj = nn.Linear(dim, dim)
-        self.gate = nn.Parameter(torch.zeros(1))
-        # CLIP-style learnable temperature: logits = cos_sim * exp(log_logit_scale), clamped so
-        # the effective temperature never drops below 0.01 (exp(log_logit_scale) <= 100).
-        self.log_logit_scale = nn.Parameter(torch.log(torch.tensor(10.0)))
-        # diag_bias is a fraction OF logit_scale, not an absolute logit value: cosine similarities
-        # are bounded in [-1,1], so a diagonal bonus of `diag_init * logit_scale` (diag_init=2.0
-        # covers the entire possible off-diagonal range twice over) reliably makes query i's own
-        # matched branch i the argmax at init, regardless of what logit_scale itself is -- an
-        # absolute bias would need re-tuning every time logit_scale moves (confirmed empirically:
-        # a fixed absolute bias of the same initial magnitude only won the diagonal ~40-60% of the
-        # time once logit_scale left its initial value). Scaling with logit_scale keeps the ratio,
-        # and therefore this init guarantee, invariant as logit_scale is learned.
-        self.diag_bias = nn.Parameter(torch.tensor(float(diag_init)))
-
-    def forward(self, query_tokens, context_tokens):
-        """query_tokens: [B, Nq, D]. context_tokens: [B, Nk, D]. Returns (updated_query
-        [B, Nq, D], attn_weights [B, Nq, Nk] averaged over heads)."""
-        B, Nq, D = query_tokens.shape
-        Nk = context_tokens.shape[1]
-        q = self.q_proj(query_tokens).view(B, Nq, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(context_tokens).view(B, Nk, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(context_tokens).view(B, Nk, self.num_heads, self.head_dim).transpose(1, 2)
-        q = F.normalize(q, p=2, dim=-1)
-        k = F.normalize(k, p=2, dim=-1)
-        logit_scale = self.log_logit_scale.exp().clamp(max=100.0)
-        logits = (q @ k.transpose(-1, -2)) * logit_scale  # [B, heads, Nq, Nk], cosine sim in [-1,1]
-        if Nq == Nk:
-            logits = logits + torch.eye(Nq, device=logits.device, dtype=logits.dtype) * logit_scale * self.diag_bias
-        attn = torch.softmax(logits, dim=-1)
-        out = (attn @ v).transpose(1, 2).reshape(B, Nq, D)
-        out = self.out_proj(out)
-        updated_query = query_tokens + torch.tanh(self.gate) * out
-        return F.normalize(updated_query, p=2, dim=-1), attn.mean(dim=1)
