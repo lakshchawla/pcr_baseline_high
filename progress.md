@@ -2550,3 +2550,31 @@ full eval pass, `align` loss sitting at ~33 (matching `ln(751)*5`, the expected 
 short a run, not a red flag).
 
 Full repo `python -m py_compile` sweep clean.
+
+### 2026-09-17 -- branch `baseline-fixes`: initial commit + fixes 1/2/3/5 + random text erasing
+
+Branch from `5b25a2a` (VAB/TAB/CAB and the 7-branch layout left exactly as they were), applying
+only the targeted fixes from the audit (see `main`'s progress.md 2026-09-17 (4) for the audit):
+
+- Prerequisite: `_attnpool_forward` `query=x[:1]` -> `query=x` (the committed form returns an
+  empty `project()` and crashes on the first image).
+- Fix 1 -- Stage 2 `lr` 5e-6 -> 3.5e-4 (CLIP-ReID's RN50 recipe; 5e-6 is its ViT recipe).
+- Fix 2 -- CLIP-ReID's `img_feature` path: `ClipBPAMEncoder.forward_multi` exposes
+  `x4 = avgpool(layer4)` [B, 2048]; Stage 2 `X4Head` (BNNeck + classifier) with id on BN(x4) and
+  triplet on raw x4; the evaluator extracts post-BN unit-norm x4 and fuses its euclidean distance
+  with the part-wise distance as "one more branch" (`fuse_distances`, `eval.x4_weight`, 0 = old
+  descriptor). Every eval logs branches-only / x4-only / fused mAP. Stage 3 callers adapted to
+  extract_features' 4-tuple.
+- Fix 3 -- id classifier on BN(native CLIP global, last branch) -- CLIP-ReID's `classifier_proj`.
+- Fix 5 -- Stage 2 batch 32 -> 64 (P16 x K4). OOM on the 8 GB laptop card with this architecture;
+  smoke-tested at 32, 64 is for the training server.
+- Random text erasing (`loss.text_erase_prob: 0.3`): per sample, each text-prototype branch is
+  dropped from CAB's context (zeroed value, -inf attention logit via the new `context_mask`
+  argument) and from L_align (weight 0); L_crossalign's target is renormalized over the surviving
+  columns; at least one branch always survives. Training mode only.
+
+Verified: CPU gates (encoder x4 == avgpool(layer4), old forward/forward_full unchanged; CAB mask
+gives erased columns exactly 0 attention and an all-True mask is a no-op; erase sampler rate/
+at-least-one; full Stage 2 loss step on real masks with gradient into X4Head, the native-global
+classifier and the backbone; evaluator fusion algebra), plus a 1-epoch GPU Stage 2 smoke at batch
+32 against the existing 7-branch Stage 1 artefacts, eval printing all three descriptors.

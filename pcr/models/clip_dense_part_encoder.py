@@ -121,11 +121,23 @@ class ClipBPAMEncoder(nn.Module):
 
         f_out = F.normalize(f_out, p=2, dim=-1)
 
-        return f_out, vis, pixels_cls_scores
+        # CLIP-ReID's `img_feature`: global average of layer4's own map ([B, vision_width], 2048
+        # for RN50), raw -- the un-projected feature its Stage 2 puts id + triplet on and half of
+        # its test descriptor (concat[BN(x4), BN(x_proj)]). Previously never computed here: every
+        # loss and the retrieval ran in the 1024-d joint space only. See forward_multi.
+        x4_global = patch_feats.mean(dim=1)
+
+        return f_out, vis, pixels_cls_scores, x4_global
 
     def forward(self, images):
-        f_out, vis, _ = self._forward_common(images)
+        f_out, vis, _, _ = self._forward_common(images)
         return f_out, vis
 
     def forward_full(self, images):
+        f_out, vis, pixels_cls_scores, _ = self._forward_common(images)
+        return f_out, vis, pixels_cls_scores
+
+    def forward_multi(self, images):
+        """(f_out [B, M, D], vis [B, M], pixels_cls_scores, x4_global [B, vision_width]) -- the
+        Stage 2 / evaluator entry point that also exposes the raw layer4 average-pooled feature."""
         return self._forward_common(images)

@@ -3,6 +3,7 @@ import time
 from collections import OrderedDict
 
 import torch
+import torch.nn.functional as F
 
 from .evaluation_metrics import cmc, mean_ap
 from .models.relation_blocks import apply_vab_with_pooling
@@ -10,42 +11,62 @@ from .utils.meters import AverageMeter
 from .utils.part_distance import compute_bpb_pairwise_distance
 
 
-def extract_part_features(model, inputs, vab=None, pool=None):
+def extract_part_features(model, inputs, vab=None, pool=None, bn_x4=None):
     """f_out is optionally mixed/pooled by VAB+AttentionPoolingBlock before being cached -- both
     need only this image's own real per-branch visibility (no label, no text), so they're fully
     computable at test time, unlike CrossAttentionBlock (CAB, see Evaluator's own docstring for
     why CAB can't run here at all). vis itself is left untouched: it's BPBreID's own visibility
     output, unaffected by VAB/pool's mixing, and compute_bpb_pairwise_distance still needs the
-    real per-branch visibility for its masking."""
+    real per-branch visibility for its masking.
+
+    Also returns x4 [B, vision_width]: CLIP-ReID's own `img_feature` (layer4 average-pooled),
+    passed through the Stage 2 BNNeck `bn_x4` when given (CLIP-ReID tests on the post-BN
+    feature, neck_feat='after') and L2-normalized (its evaluator's feat_norm='yes'). None when
+    the encoder doesn't expose forward_multi (Stage 3's BPBreID encoders)."""
     inputs = inputs.cuda()
-    f_out, vis = model(inputs)
+    if hasattr(model, 'forward_multi'):
+        f_out, vis, _, x4 = model.forward_multi(inputs)
+        if bn_x4 is not None:
+            x4 = bn_x4(x4)
+        x4 = F.normalize(x4, p=2, dim=-1).data.cpu()
+    else:
+        f_out, vis = model(inputs)
+        x4 = None
     if vab is not None:
         f_out, _ = apply_vab_with_pooling(vab, pool, f_out, vis, getattr(model, '_has_global', False))
-    return f_out.data.cpu(), vis.data.cpu()
+    return f_out.data.cpu(), vis.data.cpu(), x4
 
 
-def extract_features(model, data_loader, vab=None, pool=None, print_freq=50):
+def extract_features(model, data_loader, vab=None, pool=None, bn_x4=None, print_freq=50):
+    """Returns (features, visibilities, labels, x4_features): the first three as before (fname ->
+    [M, D] / [M] / pid); x4_features is fname -> [vision_width] (see extract_part_features), or an
+    empty dict for encoders without forward_multi."""
     model.eval()
     if vab is not None:
         vab.eval()
         pool.eval()
+    if bn_x4 is not None:
+        bn_x4.eval()
     batch_time = AverageMeter()
     data_time = AverageMeter()
 
     features = OrderedDict()  # fname -> [M, D]
     visibilities = OrderedDict()  # fname -> [M]
     labels = OrderedDict()
+    x4_features = OrderedDict()  # fname -> [vision_width]
 
     end = time.time()
     with torch.no_grad():
         for i, (imgs, fnames, pids, _, _) in enumerate(data_loader):
             data_time.update(time.time() - end)
 
-            f_out, vis = extract_part_features(model, imgs, vab, pool)
-            for fname, emb, v, pid in zip(fnames, f_out, vis, pids):
+            f_out, vis, x4 = extract_part_features(model, imgs, vab, pool, bn_x4)
+            for j, (fname, emb, v, pid) in enumerate(zip(fnames, f_out, vis, pids)):
                 features[fname] = emb
                 visibilities[fname] = v
                 labels[fname] = pid
+                if x4 is not None:
+                    x4_features[fname] = x4[j]
 
             batch_time.update(time.time() - end)
             end = time.time()
@@ -58,7 +79,7 @@ def extract_features(model, data_loader, vab=None, pool=None, print_freq=50):
                               batch_time.val, batch_time.avg,
                               data_time.val, data_time.avg))
 
-    return features, visibilities, labels
+    return features, visibilities, labels, x4_features
 
 
 def pairwise_distance(features, visibilities, query=None, gallery=None):
@@ -77,6 +98,24 @@ def pairwise_distance(features, visibilities, query=None, gallery=None):
     yv = torch.stack([visibilities[f] for f, _, _ in gallery], dim=0)
     dist_m = compute_bpb_pairwise_distance(x, xv, y, yv)
     return dist_m, x, y
+
+
+def x4_pairwise_distance(x4_features, query, gallery):
+    """Plain euclidean distance between the (already BN'd + unit-normalized) x4 features --
+    CLIP-ReID's own test-time metric on its `img_feature`. [Nq, Ng]."""
+    x = torch.stack([x4_features[f] for f, _, _ in query], dim=0)
+    y = torch.stack([x4_features[f] for f, _, _ in gallery], dim=0)
+    return torch.cdist(x, y)
+
+
+def fuse_distances(dist_parts, dist_x4, num_branches, x4_weight=1.0):
+    """Treats x4 as one more branch alongside the M joint-space ones: dist_parts is already the
+    mean over the (visible) M branches of per-branch euclidean distances on unit vectors, and
+    dist_x4 is the same kind of distance on one more unit vector, so
+    (M * dist_parts + w * dist_x4) / (M + w) is the visibility-agnostic "M+1 branch mean" (exact
+    when every branch is visible; with occlusions the part term is a mean over fewer branches,
+    which this keeps rather than re-weighting -- a deliberate, simple fusion, not a tuned one)."""
+    return (num_branches * dist_parts + x4_weight * dist_x4) / (num_branches + x4_weight)
 
 
 def evaluate_all(query_features, gallery_features, distmat, query=None, gallery=None,
@@ -131,14 +170,35 @@ class Evaluator(object):
     during training, not something applied again at inference.
     """
 
-    def __init__(self, model, vab=None, pool=None):
+    def __init__(self, model, vab=None, pool=None, bn_x4=None, x4_weight=1.0):
+        """bn_x4: the Stage 2 BNNeck on the x4 feature (live instance), or None to evaluate on
+        the raw x4. x4_weight: weight of the x4 distance relative to one joint-space branch in
+        fuse_distances (0 disables the x4 term entirely)."""
         super(Evaluator, self).__init__()
         self.model = model
         self.vab = vab
         self.pool = pool
+        self.bn_x4 = bn_x4
+        self.x4_weight = x4_weight
 
     def evaluate(self, data_loader, query, gallery, cmc_flag=False):
-        features, visibilities, _ = extract_features(self.model, data_loader, self.vab, self.pool)
+        """Prints mAP for the joint-space branches alone, x4 alone, and the fusion; returns the
+        fusion's result (the descriptor that is the model's actual output) -- the two components
+        are logged so a run's log shows which side is carrying the retrieval."""
+        features, visibilities, _, x4_features = extract_features(self.model, data_loader, self.vab,
+                                                                  self.pool, self.bn_x4)
         distmat, query_features, gallery_features = pairwise_distance(features, visibilities, query, gallery)
-        return evaluate_all(query_features, gallery_features, distmat,
+        if not x4_features or self.x4_weight <= 0:
+            return evaluate_all(query_features, gallery_features, distmat,
+                                 query=query, gallery=gallery, cmc_flag=cmc_flag)
+
+        dist_x4 = x4_pairwise_distance(x4_features, query, gallery)
+        num_branches = query_features.size(1)
+        fused = fuse_distances(distmat, dist_x4, num_branches, self.x4_weight)
+        print('  [joint-space branches only]', end=' ')
+        evaluate_all(query_features, gallery_features, distmat, query=query, gallery=gallery, cmc_flag=False)
+        print('  [x4 only]', end=' ')
+        evaluate_all(query_features, gallery_features, dist_x4, query=query, gallery=gallery, cmc_flag=False)
+        print('  [fused: branches + x4]', end=' ')
+        return evaluate_all(query_features, gallery_features, fused,
                              query=query, gallery=gallery, cmc_flag=cmc_flag)

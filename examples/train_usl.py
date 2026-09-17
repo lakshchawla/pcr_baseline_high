@@ -182,7 +182,7 @@ def main_worker(args):
     for epoch in range(args.epochs):
         cluster_loader = get_test_loader(dataset_target, args.height, args.width,
                                           args.test_batch_size, args.workers, testset=sorted(dataset_target.train))
-        features, visibilities, _ = extract_features(model_ema, cluster_loader, print_freq=50)
+        features, visibilities, _, _ = extract_features(model_ema, cluster_loader, print_freq=50)
         train_set = sorted(dataset_target.train)
         cf = torch.stack([features[f] for f, _, _ in train_set]).cuda()
         cf_vis = torch.stack([visibilities[f] for f, _, _ in train_set]).cuda()

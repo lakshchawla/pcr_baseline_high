@@ -62,8 +62,11 @@ data:
   data_dir: ../datasets
   height: 384
   width: 128
-  batch_size: 32
-  num_instances: 4             # PK sampling: batch_size // num_instances identities per batch
+  batch_size: 64               # fix 5: CLIP-ReID's RN50 recipe, P16 x K4 (was 32 = P8 x K4 --
+  num_instances: 4             # half the identities per batch for triplet mining / BN stats).
+                                # Needs > 8 GB with this architecture (the every-location attnpool
+                                # is 193x193 x 32 heads per image): OOM on the 8 GB laptop card,
+                                # which runs 32 at ~6.5 GB -- 64 is for the training server.
   workers: 4
   # Algorithm 2 step 9/16 treats L_attn (the BPA/pixel-supervision loss below) as mandatory, not
   # optional -- default to Market1501's real masks (matching Stage 0's own default) rather than
@@ -94,6 +97,11 @@ loss:
   # drop true degenerate cases (a branch reading as essentially never-visible), not gate whole
   # images out of training the way that filter did.
   triplet_visibility_min: 0.05
+  # Random text erasing (train_relational_finetune.py::sample_text_erase_mask): per sample, each
+  # text-prototype branch is dropped from CAB's context and from L_align with this probability
+  # (at least one branch always survives). Dropout-style regularizer on the text grounding, and a
+  # nudge toward the inference condition (no text at all at retrieval). 0 disables it.
+  text_erase_prob: 0.3
   align_weight: 0.5             # lambda_clip in Algorithm 2's own notation -- the one term the
                                  # algorithm itself gives an explicit, separate coefficient
   # CosineAlignLoss is a softmax classification against the full identity-prototype table (see
@@ -123,11 +131,10 @@ loss:
   centroid_momentum: 0.2
 
 optim:
-  # CLIP-ReID's own Stage 2 recipe uses ~5e-6 here (not Stage 1's 3.5e-4) -- fine-tuning an
-  # already-pretrained CLIP backbone at prompt-learning-scale LR drags it out of CLIP's joint
-  # embedding space. Was 0.00035 (same as Stage 1, applied uniformly to backbone+heads via
-  # build_optimizer's flat RN50 param group) -- 70x CLIP-ReID's own value.
-  lr: 0.000005
+  # Fix 1: CLIP-ReID's RN50 Stage 2 LR (configs/person/cnn_clipreid.yml: BASE_LR 0.00035). The
+  # 0.000005 this file carried before is CLIP-ReID's ViT recipe (vit_clipreid.yml), applied here by
+  # mistake -- on RN50 it trained the backbone ~70x too slowly (75.9 mAP at 120 epochs).
+  lr: 0.00035
   weight_decay: 0.0005
   epochs: 120
   step_size: 70
@@ -159,6 +166,13 @@ vit:
   # freshly-unfrozen, heavily-pretrained ViT benefits from proportionally more warmup before any
   # layer (even at its own LLRD-scaled LR) hits full speed.
   warmup_epochs: 20
+
+eval:
+  # Fix 2: retrieval descriptor = the M joint-space branches (part-wise distance) fused with
+  # CLIP-ReID's BN(x4) feature (pcr/evaluators.py::fuse_distances). x4_weight is x4's weight
+  # relative to ONE joint-space branch (1.0 = "one more branch"); 0 = joint-space branches only,
+  # i.e. the pre-fix descriptor. The evaluator logs all three (branches / x4 / fused) every eval.
+  x4_weight: 1.0
 
 logging:
   # New dir, not the old stage2_finetune (BPBreIDEncoder(HRNet32)-shaped 'state_dict', a

@@ -315,9 +315,13 @@ class CrossAttentionBlock(nn.Module):
         # and therefore this init guarantee, invariant as logit_scale is learned.
         self.diag_bias = nn.Parameter(torch.tensor(float(diag_init)))
 
-    def forward(self, query_tokens, context_tokens):
-        """query_tokens: [B, Nq, D]. context_tokens: [B, Nk, D]. Returns (updated_query
-        [B, Nq, D], attn_weights [B, Nq, Nk] averaged over heads)."""
+    def forward(self, query_tokens, context_tokens, context_mask=None):
+        """query_tokens: [B, Nq, D]. context_tokens: [B, Nk, D]. context_mask: optional [B, Nk]
+        bool, True = this context token is available; False = erased (Stage 2's random text
+        erasing) -- it gets no attention weight at all, so the query can only ground itself on
+        the surviving text branches. Every row must keep at least one True (the caller
+        guarantees it; an all-False row would softmax to NaN). Returns (updated_query
+        [B, Nq, D], attn_weights [B, Nq, Nk] averaged over heads; erased columns are exactly 0)."""
         B, Nq, D = query_tokens.shape
         Nk = context_tokens.shape[1]
         q = self.q_proj(query_tokens).view(B, Nq, self.num_heads, self.head_dim).transpose(1, 2)
@@ -329,6 +333,8 @@ class CrossAttentionBlock(nn.Module):
         logits = (q @ k.transpose(-1, -2)) * logit_scale  # [B, heads, Nq, Nk], cosine sim in [-1,1]
         if Nq == Nk:
             logits = logits + torch.eye(Nq, device=logits.device, dtype=logits.dtype) * logit_scale * self.diag_bias
+        if context_mask is not None:
+            logits = logits.masked_fill(~context_mask.view(B, 1, 1, Nk), float('-inf'))
         attn = torch.softmax(logits, dim=-1)
         out = (attn @ v).transpose(1, 2).reshape(B, Nq, D)
         out = self.out_proj(out)

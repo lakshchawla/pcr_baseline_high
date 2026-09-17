@@ -163,7 +163,7 @@ def main_worker(args):
     print("==> Initialize source-domain class centroids in the part hybrid memory")
     sour_cluster_loader = get_test_loader(dataset_source, args.height, args.width,
                                            args.batch_size, args.workers, testset=sorted(dataset_source.train))
-    source_features, source_vis, _ = extract_features(model, sour_cluster_loader, print_freq=50)
+    source_features, source_vis, _, _ = extract_features(model, sour_cluster_loader, print_freq=50)
     sour_fea_dict = collections.defaultdict(list)
     sour_vis_dict = collections.defaultdict(list)
     for f, pid, _ in sorted(dataset_source.train):
@@ -189,7 +189,7 @@ def main_worker(args):
     print("==> Initialize target-domain instance features in the part hybrid memory")
     tgt_cluster_loader = get_test_loader(dataset_target, args.height, args.width,
                                           args.batch_size, args.workers, testset=sorted(dataset_target.train))
-    target_features, _, _ = extract_features(model, tgt_cluster_loader, print_freq=50)
+    target_features, _, _, _ = extract_features(model, tgt_cluster_loader, print_freq=50)
     # already per-branch L2-normalized by BPBReIDEncoder.forward
     target_features = torch.stack([target_features[f] for f, _, _ in sorted(dataset_target.train)], 0)
     memory.features = torch.cat((source_centers, target_features), dim=0).cuda()

@@ -121,6 +121,7 @@ from pcr.models.clip_vit_bpam_encoder import ClipViTBPAMEncoder
 from pcr.models.bn_neck import PartBNNecks
 from pcr.models.hm import PartHybridMemory
 from pcr.models.id_classifier import PartIdClassifiers
+import torch.nn as nn
 from pcr.models.relation_blocks import (VisualAttentionBlock, CrossAttentionBlock,
                                          AttentionPoolingBlock, apply_vab_with_pooling)
 from pcr.loss import (PartTripletLoss, CrossEntropyLabelSmooth, CosineAlignLoss, BodyPartAttentionLoss,
@@ -272,7 +273,38 @@ def _llrd_param_groups(named_params, base_lr, num_depths, depth_fn, weight_decay
     return groups
 
 
-def build_optimizer(encoder, id_classifiers, vab, pool, bn_necks, cab_i2t, cfg):
+class X4Head(nn.Module):
+    """CLIP-ReID's `bottleneck` + `classifier` on `img_feature` (layer4 average-pooled, 2048-d
+    for RN50): a BNNeck (frozen bias, BoT) and an id classifier. The BNNeck is also what the
+    evaluator applies to x4 at test time (CLIP-ReID's neck_feat='after')."""
+
+    def __init__(self, num_identities, dim):
+        super(X4Head, self).__init__()
+        self.bn = nn.BatchNorm1d(dim)
+        self.bn.bias.requires_grad_(False)
+        self.classifier = nn.Linear(dim, num_identities)
+
+    def forward(self, x4):
+        feat = self.bn(x4)
+        return feat, self.classifier(feat)
+
+
+def sample_text_erase_mask(batch_size, num_branches, erase_prob, device):
+    """Random text erasing (Stage 2): per sample, each text-prototype branch is dropped with
+    probability erase_prob -- CAB then grounds the visual branches on the surviving text only,
+    and the erased branches' align terms are skipped for that sample. Regularizes the same way
+    dropout does, and pulls training toward the inference condition, where there is NO text at
+    all (CAB never runs at retrieval). At least one branch is always kept per sample (an
+    all-erased row would give CAB nothing to attend to). Returns [B, M] bool, True = kept."""
+    keep = torch.rand(batch_size, num_branches, device=device) >= erase_prob
+    none_kept = ~keep.any(dim=1)
+    if none_kept.any():
+        rescue = torch.randint(0, num_branches, (int(none_kept.sum()),), device=device)
+        keep[none_kept.nonzero(as_tuple=True)[0], rescue] = True
+    return keep
+
+
+def build_optimizer(encoder, id_classifiers, vab, pool, bn_necks, cab_i2t, x4_head, cfg):
     """RN50/HRNet32: unchanged, single flat param list at one LR/WD -- see _llrd_param_groups'
     own docstring for why this stays untouched. ViT: layer-wise LR decay across the backbone's 24
     blocks (+patch-embed stage +final projection), decay/no-decay split everywhere, and every
@@ -280,7 +312,8 @@ def build_optimizer(encoder, id_classifiers, vab, pool, bn_necks, cab_i2t, cfg):
     which have a pretrained "depth" of their own) at the backbone's full, undecayed LR."""
     if not cfg.clip.arch.startswith('ViT'):
         params = (list(encoder.parameters()) + list(id_classifiers.parameters()) + list(vab.parameters())
-                  + list(pool.parameters()) + list(bn_necks.parameters()) + list(cab_i2t.parameters()))
+                  + list(pool.parameters()) + list(bn_necks.parameters()) + list(cab_i2t.parameters())
+                  + list(x4_head.parameters()))
         return torch.optim.Adam(params, lr=cfg.optim.lr, weight_decay=cfg.optim.weight_decay)
 
     num_blocks = len(encoder.backbone.resblocks)
@@ -291,7 +324,7 @@ def build_optimizer(encoder, id_classifiers, vab, pool, bn_necks, cab_i2t, cfg):
         lambda n: _vit_backbone_depth(n, num_blocks), cfg.optim.weight_decay, decay_rate)
 
     head_named_params = []
-    for i, m in enumerate([encoder.pixel_classifier, id_classifiers, vab, pool, bn_necks, cab_i2t]):
+    for i, m in enumerate([encoder.pixel_classifier, id_classifiers, vab, pool, bn_necks, cab_i2t, x4_head]):
         head_named_params.extend(('head{}.{}'.format(i, n), p) for n, p in m.named_parameters())
     groups += _llrd_param_groups(head_named_params, cfg.optim.lr, 1, lambda n: 0,
                                   cfg.optim.weight_decay, decay_rate)
@@ -327,14 +360,12 @@ def mask_to_pixel_targets(mask, pixels_cls_scores):
     return mask.argmax(dim=1)
 
 
-def compute_losses(encoder, vab, pool, cab_i2t, bn_necks, id_classifiers, triplet_loss, id_loss,
+def compute_losses(encoder, vab, pool, cab_i2t, bn_necks, id_classifiers, x4_head, triplet_loss, id_loss,
                     align_loss, bpa_loss, part_memory, text_prototypes, text_self_attention, imgs,
                     mask, targets, cfg, epoch):
     use_masks = bpa_loss is not None
-    if use_masks:
-        f_out, vis, pixels_cls_scores = encoder.forward_full(imgs)
-    else:
-        f_out, vis = encoder(imgs)
+    f_out, vis, pixels_cls_scores, x4 = encoder.forward_multi(imgs)
+    if not use_masks:
         pixels_cls_scores = None
 
     # apply_vab_with_pooling (not bare vab()): foreground gates the K parts, VAB relationally
@@ -352,7 +383,16 @@ def compute_losses(encoder, vab, pool, cab_i2t, bn_necks, id_classifiers, triple
     # CLIP forward pass -- text_prototypes is already the exact per-branch table Stage 1 produced,
     # indexed by this batch's real identity labels.
     prompt_feats = text_prototypes[targets]  # [B, 1+K, D]
-    vis_grounded, A_cross_i2t = cab_i2t(combined, prompt_feats)
+    # Random text erasing (see sample_text_erase_mask): erased branches are zeroed as CAB values,
+    # masked out of its attention, and dropped from L_align for that sample. Training only --
+    # in eval mode every branch is kept (the evaluator never runs CAB anyway).
+    if encoder.training and cfg.loss.text_erase_prob > 0:
+        text_keep = sample_text_erase_mask(prompt_feats.size(0), prompt_feats.size(1),
+                                           cfg.loss.text_erase_prob, prompt_feats.device)
+    else:
+        text_keep = torch.ones(prompt_feats.shape[:2], dtype=torch.bool, device=prompt_feats.device)
+    prompt_feats = prompt_feats * text_keep.unsqueeze(-1)
+    vis_grounded, A_cross_i2t = cab_i2t(combined, prompt_feats, context_mask=text_keep)
 
     # vis shares combined's exact branch axis (0=foreground, 1..K=parts) -- both are built from
     # the same encoder call. Loose hard exclusion for triplet's batch-hard mining only (soft
@@ -370,6 +410,22 @@ def compute_losses(encoder, vab, pool, cab_i2t, bn_necks, id_classifiers, triple
     bn_global = bn_necks(combined, 0)
     id_logits = id_classifiers(bn_global.unsqueeze(1), 0)
     l_id = id_loss(id_logits, targets)
+    # Fix 3: CLIP's own native global (the last branch, x_proj -- previously trained by
+    # align + triplet only) gets CLIP-ReID's `classifier_proj` on its BN'd feature.
+    if encoder._has_global:
+        native = num_branches - 1
+        # PartIdClassifiers slices f_out[:, branch] itself, so hand it a tensor with the BN'd
+        # native global sitting at index `native` (the other slots are never read).
+        bn_native = combined.detach().clone()
+        bn_native[:, native] = bn_necks(combined, native)
+        l_id = l_id + id_loss(id_classifiers(bn_native, native), targets)
+    # Fix 2: CLIP-ReID's `img_feature` path -- id on BN(x4) (its `classifier`) and, below, triplet
+    # on raw x4. This 2048-d feature is half of CLIP-ReID's test descriptor and was previously
+    # neither trained nor used anywhere in this pipeline.
+    bn_x4, x4_logits = x4_head(x4)
+    l_id_x4 = id_loss(x4_logits, targets)
+    total = total + cfg.loss.id_weight * l_id_x4
+    log['id_x4'] = l_id_x4.item()
     total = total + cfg.loss.id_weight * l_id
     log['id'] = l_id.item()
 
@@ -385,6 +441,11 @@ def compute_losses(encoder, vab, pool, cab_i2t, bn_necks, id_classifiers, triple
         l_tri_global = global_result[0]
         total = total + cfg.loss.triplet_weight * l_tri_global
         log['tri_global'] = l_tri_global.item()
+
+    x4_result = triplet_loss(x4.unsqueeze(1), targets)  # raw, un-normalized -- CLIP-ReID's own convention
+    if x4_result is not None:
+        total = total + cfg.loss.triplet_weight * x4_result[0]
+        log['tri_x4'] = x4_result[0].item()
 
     l_tri_parts = f_out.new_zeros(())
     for branch in range(1, num_branches):
@@ -405,7 +466,9 @@ def compute_losses(encoder, vab, pool, cab_i2t, bn_necks, id_classifiers, triple
     for branch in range(num_branches):
         branch_prototypes = text_prototypes[:, branch, :]  # [num_identities, D], full table -- the
                                                              # negatives this loss classifies against
-        w = vis[:, branch]  # continuous weighting, not the boolean vis_mask used for triplet
+        # continuous visibility weighting (not triplet's boolean mask), zeroed for branches whose
+        # text was erased for this sample -- there is no prototype to align to there.
+        w = vis[:, branch] * text_keep[:, branch].float()
         # BNNeck again: align_loss reads the post-BN feature too (triplet, above, still reads
         # combined directly). Reads vis_grounded (CAB's output), not combined -- CAB is what
         # grounds this branch against text before align_loss compares it to the prototype table.
@@ -423,7 +486,12 @@ def compute_losses(encoder, vab, pool, cab_i2t, bn_necks, id_classifiers, triple
     # crossalign_schedule) since CAB starts as an identity function (gate=0) and benefits from a
     # few epochs of plain L_align pressure first.
     lambda_crossalign = crossalign_schedule(epoch, cfg.optim.epochs, cfg.cab)
-    l_crossalign = cross_attention_alignment_loss(A_cross_i2t, text_self_attention[targets])
+    # Target restricted to the surviving text columns and renormalized per row: CAB's attention
+    # over erased columns is exactly 0, so the target's mass there must be redistributed or the
+    # KL is comparing against an unreachable distribution.
+    crossalign_target = text_self_attention[targets] * text_keep.unsqueeze(1).float()
+    crossalign_target = crossalign_target / crossalign_target.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+    l_crossalign = cross_attention_alignment_loss(A_cross_i2t, crossalign_target)
     total = total + lambda_crossalign * l_crossalign
     log['crossalign'] = l_crossalign.item()
 
@@ -501,8 +569,13 @@ def main_worker(cfg, setup_only=False):
     text_self_attention = load_checkpoint(attn_path)['text_self_attention'].cuda()  # [num_identities, num_branches, num_branches]
 
     encoder = build_encoder(cfg)
-    id_classifiers = PartIdClassifiers(num_identities, cfg.model.dim_reduce_output, branches=(0,)).cuda()
+    # Classifiers on the pooled global (branch 0) and, fix 3, on CLIP's native global (last
+    # branch) -- CLIP-ReID's `classifier_proj`.
+    id_branches = (0, num_branches - 1) if has_global_branch else (0,)
+    id_classifiers = PartIdClassifiers(num_identities, cfg.model.dim_reduce_output, branches=id_branches).cuda()
     bn_necks = PartBNNecks(num_branches, cfg.model.dim_reduce_output).cuda()
+    # Fix 2: CLIP-ReID's img_feature head on the raw layer4 average (vision_width = 2048 on RN50).
+    x4_head = X4Head(num_identities, encoder.backbone.vision_width).cuda()
 
     vab = VisualAttentionBlock(dim=cfg.model.dim_reduce_output, num_heads=cfg.vab.num_heads,
                                num_layers=cfg.vab.num_layers).cuda()
@@ -561,7 +634,7 @@ def main_worker(cfg, setup_only=False):
     vab.eval()
     init_loader = get_test_loader(dataset, cfg.data.height, cfg.data.width, cfg.data.batch_size,
                                    cfg.data.workers, testset=train_set)
-    init_features, init_vis, _ = extract_features(encoder, init_loader, vab, pool)
+    init_features, init_vis, _, _ = extract_features(encoder, init_loader, vab, pool)
     fea_dict = collections.defaultdict(list)
     vis_dict = collections.defaultdict(list)
     for fname, pid, _ in train_set:
@@ -579,7 +652,7 @@ def main_worker(cfg, setup_only=False):
     del init_loader, init_features, init_vis, fea_dict, vis_dict, centers
     print('==> part_memory initialized for {} identities'.format(num_identities))
 
-    optimizer = build_optimizer(encoder, id_classifiers, vab, pool, bn_necks, cab_i2t, cfg)
+    optimizer = build_optimizer(encoder, id_classifiers, vab, pool, bn_necks, cab_i2t, x4_head, cfg)
     # BoT's own recommended schedule (Luo et al., CVPRW 2019) -- linear warmup for
     # cfg.optim.warmup_epochs (default 10), starting from cfg.optim.warmup_factor x the base LR,
     # then the same step decay this file used before (a single drop by 10x at cfg.optim.step_size)
@@ -604,7 +677,9 @@ def main_worker(cfg, setup_only=False):
     # automatically at every periodic evaluator.evaluate() call below, no extra wiring needed.
     # CAB is deliberately not passed -- see Evaluator's own docstring (pcr/evaluators.py) for why
     # it can't run at inference at all (needs the ground-truth identity to index text_prototypes).
-    evaluator = Evaluator(encoder, vab, pool)
+    # bn_x4: retrieval uses the post-BN x4 feature (CLIP-ReID's neck_feat='after'), fused with
+    # the joint-space branches -- see Evaluator; x4_weight from the config.
+    evaluator = Evaluator(encoder, vab, pool, bn_x4=x4_head.bn, x4_weight=cfg.eval.x4_weight)
 
     best_mAP = 0
     for epoch in range(cfg.optim.epochs):
@@ -613,6 +688,7 @@ def main_worker(cfg, setup_only=False):
         pool.train()
         bn_necks.train()
         cab_i2t.train()
+        x4_head.train()
         train_loader.new_epoch()
         train_iters = len(train_loader)
 
@@ -628,7 +704,7 @@ def main_worker(cfg, setup_only=False):
             targets = targets.cuda()
 
             optimizer.zero_grad()
-            loss, log = compute_losses(encoder, vab, pool, cab_i2t, bn_necks, id_classifiers, triplet_loss,
+            loss, log = compute_losses(encoder, vab, pool, cab_i2t, bn_necks, id_classifiers, x4_head, triplet_loss,
                                         id_loss, align_loss, bpa_loss, part_memory, text_prototypes,
                                         text_self_attention, imgs, mask, targets, cfg, epoch)
             loss.backward()
@@ -670,6 +746,7 @@ def main_worker(cfg, setup_only=False):
                 'pool_state_dict': pool.state_dict(),
                 'bn_necks_state_dict': bn_necks.state_dict(),
                 'cab_i2t_state_dict': cab_i2t.state_dict(),
+                'x4_head_state_dict': x4_head.state_dict(),
                 'epoch': epoch + 1,
                 'best_mAP': best_mAP,
                 'optimizer': optimizer.state_dict(),
@@ -686,6 +763,7 @@ def main_worker(cfg, setup_only=False):
         # the best epoch's encoder with whatever epoch training happened to end on for vab/pool,
         # which is not what "best model" means now that the evaluator reads VAB-mixed, pooled features.
         vab.load_state_dict(checkpoint['vab_state_dict'])
+        x4_head.load_state_dict(checkpoint['x4_head_state_dict'])
         pool.load_state_dict(checkpoint['pool_state_dict'])
     else:
         print('No model_best.pth.tar in {}, testing with the final model'.format(cfg.logging.logs_dir))

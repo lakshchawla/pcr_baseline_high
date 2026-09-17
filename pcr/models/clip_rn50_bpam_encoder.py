@@ -119,7 +119,7 @@ class ClipRN50DenseBackbone(nn.Module):
         x = x + self.positional_embedding[:, None, :].to(x.dtype)
         ap = self.attnpool
         out, _ = F.multi_head_attention_forward(
-            query=x[:1], key=x, value=x,
+            query=x, key=x, value=x,
             embed_dim_to_check=x.shape[-1], num_heads=self.num_heads,
             q_proj_weight=ap.q_proj.weight, k_proj_weight=ap.k_proj.weight, v_proj_weight=ap.v_proj.weight,
             in_proj_weight=None,
