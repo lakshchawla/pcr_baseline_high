@@ -2704,3 +2704,51 @@ pool gate and pixel_classifier. Both earlier gate suites re-pass. Full-repo `py_
 a real run; Stage 2 additionally needs a Stage 1 dir that contains `pixel_classifier.pth`.
 
 CLAUDE.md rewritten for the current architecture.
+
+### 2026-09-17 (4) -- Root cause found; architecture reduced to CLIP-ReID + per-part branches
+
+**Audit of the initial commit** (every file on the training path, plus CLIP-ReID's own code and
+configs as the reference). Backfiring, ranked:
+1. `ClipRN50DenseBackbone._attnpool_forward` re-ran CLIP's attnpool with every location as a
+   query. CLIP trained it for one (mean-token) query; on real images the 192 patch queries'
+   attention rows agree at cosine 0.925, so every patch's projected feature is ~the same
+   image-wide average (patch-vs-patch 0.83). Parts pooled from it: 0.976 to each other and 0.98
+   to the native global, IN THE FROZEN ENCODER. Per-branch retrieval ablation on the 75.9-mAP
+   Stage 2 checkpoint: all 7 branches 75.6, native global alone 75.7, parts alone 75.4, part 1
+   (head) alone 75.2, part 5 (feet) alone 75.2 -- the part machinery was inert. Every symptom
+   chased earlier (prompt collapse 0.98, VAB gate 0, static blend map) descends from this.
+2. Stage 2 `lr: 5e-6` is CLIP-ReID's ViT recipe; its RN50 recipe (cnn_clipreid.yml) is 3.5e-4,
+   batch 64, 120 epochs, steps [40,70], 10-epoch warmup. The comment claiming "CLIP-ReID's own
+   value" was wrong; the backbone trained ~70x too slowly.
+3. Seven branches, three of them globals, splitting id/triplet/align over identical copies; no
+   CLIP-ReID-style id on BN(avgpool x4)+BN(x_proj) or triplet on x3/x4/x_proj.
+4. TAB ungated (scale 34 vs 0.4, uniform mixing); 5. VAB/CAB dead or unused at retrieval;
+6. centroid memory, L_crossalign, L_relalign with no counterpart in the reference.
+
+**Rewrite** (this commit): CLIP-ReID's image path plus one branch per part, nothing else.
+- Backbone: `forward_multi` -> (x3, x4); `project_global` = CLIP's mean-token attnpool (x_proj);
+  `project_dense` = MaskCLIP v_proj->c_proj. ViT backbone gets the same two methods.
+- `ClipBPAMEncoder.forward_multi` -> x3, x4, x_proj, part_x4 (mask-pooled x4), part_xproj
+  (mask-pooled project_dense), vis [B,1+K], pixels_cls_scores. Branches: 0 = x_proj, 1..K =
+  parts. No foreground branch, no duplicated globals. Measured frozen: part-vs-part 0.76-0.80,
+  part-vs-global 0.73 (was 0.976 / 0.980). forward()/forward_full() keep Stage 0/3's interface.
+- Removed: `relation_blocks.py` entirely (TAB, VAB, CAB, pool), `identity_visibility`, the Stage 1
+  blend/BPAM-continuation wiring (the encoder's opt-in blend path is retained, unwired), the
+  centroid memory, `fusion:`/`pool:`/`tab:`/`bpam:`/`clip_native_mask:` config sections.
+- Stage 1 = CLIP-ReID Stage 1 per branch (SupCon i2t/t2i) + `PartDiagLoss`; trains ctx only.
+- Stage 2 = CLIP-ReID Stage 2 + parts: id on BN(x4), BN(x_proj), BN(part_x4[k]) (vis-weighted);
+  triplet on x3/x4/x_proj + BPBreID part-triplet on part_x4; align (I2T) per branch against its
+  own prototype table; BPA. Recipe set to CLIP-ReID RN50's (3.5e-4, batch 64, [40,70], warmup
+  10). `Heads` bundles the necks/classifiers; checkpoint = {state_dict, heads_state_dict}.
+- Evaluator: `Evaluator(model)`, joint-space branches, part-wise distance.
+
+**Verified**: CPU gates (encoder layouts, x_proj == CLIP's own attnpool output, part-vs-part
+0.762 on real images, PromptLearner without TAB, a Stage 1 step, a Stage 2 loss step on real
+masks with gradient into every trainable head/backbone/classifier param, evaluator); GPU:
+1-epoch Stage 1 (20 s/epoch; frozen part-vs-part 0.799, prompt part-cos 0.721 after one epoch),
+cache_text_anchors (prototype part-cos 0.728), 1-epoch Stage 2 with eval (40 s/epoch, 2 GB at
+batch 32), all into scratch dirs. Full-repo py_compile clean. CLAUDE.md rewritten.
+
+**Next**: full Stage 1 -> anchors -> Stage 2 run, then the per-branch retrieval ablation on the
+result: parts-only / global-only / all. That single table decides whether the parts carry
+information the global doesn't.

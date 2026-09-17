@@ -1,13 +1,13 @@
 """Per-identity, per-branch prompt learning, generalized from CLIP-ReID's PromptLearner
-(../CLIP-ReID/model/make_model_clipreid.py, lines 191-239), with a relational-mixing step
-(TextualAttentionBlock, pcr/models/relation_blocks.py) across all M=1+K branches' context tokens
-(global/foreground + K parts, uniformly) before any branch's prompt is assembled.
+(../CLIP-ReID/model/make_model_clipreid.py, lines 191-239): one learnable n_ctx-token context per
+(identity, branch), spliced into the fixed template and pushed through the frozen CLIP text
+encoder. No mixing across branches (the TextualAttentionBlock that used to sit here was removed
+2026-09-17 -- see progress.md: it was the fastest route to the K part prompts collapsing into
+one identity vector, and CLIP-ReID's own design needs nothing between ctx and the encoder).
 """
 import clip
 import torch
 import torch.nn as nn
-
-from .relation_blocks import TextualAttentionBlock
 
 
 class PromptLearner(nn.Module):
@@ -23,10 +23,8 @@ class PromptLearner(nn.Module):
     far uses n_ctx=4), but fixed at the root rather than left as a landmine for the next config
     that changes it.
 
-    One learnable context tensor, `ctx` ([num_identities, num_branches*n_ctx, ctx_dim]), flat so
-    TextualAttentionBlock can attend across all M=1+K branches at once (branch 0 = global/
-    foreground, 1..K = parts) -- a transformer layer needs its input as one sequence, not M
-    separate blocks.
+    One learnable context tensor, `ctx` ([num_identities, num_branches*n_ctx, ctx_dim]), laid out
+    as M=1+K contiguous n_ctx-token blocks (branch 0 = global, 1..K = parts).
 
     Deviation from CLIP-ReID's original, found by actually running the training loop (back when
     this repo still only had UDA/USL, long before this file existed): CLIP-ReID creates its
@@ -38,15 +36,9 @@ class PromptLearner(nn.Module):
     accumulation into the fp32 parameter).
     """
 
-    def __init__(self, num_identities, num_parts, clip_text_encoder, n_ctx=4,
-                 tab_num_heads=4, tab_num_layers=1, device='cuda', has_global_branch=False,
-                 tab_gated=True):
-        """has_global_branch: must match the image encoder's own ClipBPAMEncoder._has_global --
-        True only for ClipRN50BPAMEncoder currently (see that class's own docstring: a genuine
-        7th branch, CLIP's own native whole-image embedding, appended after foreground+parts).
-        Adds one more n_ctx-token context block for it, same as every other branch gets -- this
-        class has no notion of what makes a branch special, it just needs to know how many there
-        are, exactly like TextualAttentionBlock/VisualAttentionBlock already do."""
+    def __init__(self, num_identities, num_parts, clip_text_encoder, n_ctx=4, device='cuda'):
+        """num_branches = 1 + num_parts: branch 0 is the global (matched to the encoder's x_proj),
+        1..K the parts (matched to part_xproj) -- see clip_dense_part_encoder.py."""
         super(PromptLearner, self).__init__()
         # transformer_width, NOT embed_dim -- these tokens get concatenated with token_prefix/
         # token_suffix below (built from clip_text_encoder.token_embedding, which outputs
@@ -73,7 +65,7 @@ class PromptLearner(nn.Module):
         prefix_only = clip.tokenize(prefix_text).to(device)
         prefix_len = int((prefix_only != 0).sum().item()) - 1  # drop the isolated EOT, keep SOT
 
-        num_branches = (2 if has_global_branch else 1) + num_parts
+        num_branches = 1 + num_parts
 
         # fp32 master weights, cast to the frozen buffers' dtype only in build_part_prompts() --
         # see the class docstring for why (GradScaler forbids fp16 leaf parameters)
@@ -81,9 +73,6 @@ class PromptLearner(nn.Module):
         nn.init.normal_(ctx_vectors, std=0.02)
         self.ctx = nn.Parameter(ctx_vectors)
 
-        # tab_gated=False only for replaying pre-gate checkpoints (see TextualAttentionBlock).
-        self.tab = TextualAttentionBlock(ctx_dim, n_ctx=n_ctx, num_heads=tab_num_heads,
-                                          num_layers=tab_num_layers, gated=tab_gated)
         self.prompt_dtype = dtype
 
         # not trained, but must move with the module (.cuda()/.to()) -- registered as buffers
@@ -105,23 +94,14 @@ class PromptLearner(nn.Module):
         suffix = self.token_suffix.expand(b, -1, -1)
         return torch.cat([prefix, ctx, suffix], dim=1)
 
-    def build_part_prompts(self, labels, branch_visibility):
-        """labels: [B] identity indices. branch_visibility: [B, num_branches], each identity's
-        mean per-branch visibility, branch 0 (global/foreground) included (see
-        examples/train_relational_prompts.py's compute_identity_visibility) -- passed straight
-        through to TextualAttentionBlock as a soft attention bias. Returns (prompts, tab_attn):
-        prompts is a list of `num_branches` tensors, each [B, 77, ctx_dim], in branch order (0 =
-        global/foreground, 1..K = parts) -- one shared TextualAttentionBlock pass mixes all M
-        branches' context together before this class slices back into per-branch n_ctx-token
-        blocks. tab_attn is that same call's own [B, num_branches, num_branches] attention
-        pattern (see TextualAttentionBlock.forward), most callers ignore it -- only
-        train_relational_prompts.py's L_relalign consumes it."""
-        raw_ctx = self.ctx[labels]  # [B, num_branches*n_ctx, ctx_dim], fp32 -- matches tab's fp32 params
-        mixed_ctx, tab_attn = self.tab(raw_ctx, branch_visibility)
-        mixed_ctx = mixed_ctx.type(self.prompt_dtype)
+    def build_part_prompts(self, labels):
+        """labels: [B] identity indices. Returns a list of `num_branches` tensors, each
+        [B, 77, ctx_dim], in branch order (0 = global, 1..K = parts): that identity's own context
+        block for the branch, spliced between the frozen prefix and suffix -- a pure lookup, no
+        cross-branch mixing."""
+        ctx = self.ctx[labels].type(self.prompt_dtype)  # [B, num_branches*n_ctx, ctx_dim]
         prompts = []
         for b in range(self.num_branches):
             start = b * self.n_ctx
-            prompts.append(self._splice(mixed_ctx[:, start:start + self.n_ctx, :]))
-
-        return prompts, tab_attn
+            prompts.append(self._splice(ctx[:, start:start + self.n_ctx, :]))
+        return prompts

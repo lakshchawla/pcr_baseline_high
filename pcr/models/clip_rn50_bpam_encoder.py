@@ -27,12 +27,16 @@ class ClipRN50DenseBackbone(nn.Module):
        conv in it is stride=1 always -- so this is done by swapping those two AvgPool2d(2)
        instances (the main branch's post-conv2 one and the shortcut's pre-conv one) for
        nn.Identity(); no pretrained weight is touched or needs retraining.
-    2. AttentionPool2d's own forward only ever lets ONE token (the spatial mean) serve as query,
-       discarding every individual location's own post-attention representation (`query=x[:1]` in
-       third_party/clip/model.py -- verified directly, not assumed). `project()` below re-invokes
-       that same layer's pretrained q_proj/k_proj/v_proj/c_proj weights, completely unchanged, but
-       with every location serving as both query and key/value -- so every patch keeps its own
-       joint-space embedding instead of collapsing into one vector.
+    2. AttentionPool2d is used two ways, neither of which is "every location as query":
+       project_global() runs it exactly as CLIP does (mean-token query -> CLIP's real global
+       embedding, `x_proj`), and project_dense() bypasses its attention entirely
+       (MaskCLIP's v_proj -> c_proj per patch) to land every patch in the joint space with its
+       own identity intact. The previous design re-ran the attention with all 192 patches as
+       queries; measured on real images (2026-09-17, progress.md) their attention rows agree at
+       cosine 0.925, so every patch came out as roughly the same image-wide average and any
+       mask-pooled "part" was a copy of the global (0.976 part-vs-part). project()/project_all()
+       are kept only as that attention path for reference; nothing in the pipeline pools parts
+       from them any more.
     """
 
     def __init__(self, clip_arch='RN50', height=384, width=128, device='cuda'):
@@ -92,11 +96,14 @@ class ClipRN50DenseBackbone(nn.Module):
         if first_block.downsample is not None:
             first_block.downsample[0] = nn.Identity()  # the "-1" AvgPool2d(stride) entry
 
-    def forward(self, images):
+    def forward_multi(self, images):
         """images: [B, 3, H, W], CLIP-normalized (pcr.models.clip_dense_part_encoder.CLIP_MEAN/
-        CLIP_STD, not BPBreID's ImageNet stats). Returns patch_feats [B, grid_h*grid_w,
-        vision_width] (raw conv features, pre attention-pool) -- every location individually
-        carried to the output."""
+        CLIP_STD, not BPBreID's ImageNet stats). Returns (x3, x4): x3 is layer3's own output map
+        [B, 1024, H3, W3] (CLIP-ReID's `image_features_last`, used there for its multi-level
+        triplet term), x4 is layer4's output as patches [B, grid_h*grid_w, vision_width] (raw
+        conv features, pre attention-pool) -- every location individually carried to the
+        output. Same three outputs CLIP-ReID's ModifiedResNet.forward returns (x3, x4, xproj),
+        with xproj left to project_global() so callers that only need x4 don't pay for it."""
         x = images.type(self.dtype)
         x = self.relu1(self.bn1(self.conv1(x)))
         x = self.relu2(self.bn2(self.conv2(x)))
@@ -104,10 +111,14 @@ class ClipRN50DenseBackbone(nn.Module):
         x = self.avgpool(x)
         x = self.layer1(x)
         x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.layer4(x)  # [B, vision_width, grid_h, grid_w]
-        B, C, H, W = x.shape
-        return x.reshape(B, C, H * W).permute(0, 2, 1).float()  # [B, N, vision_width]
+        x3 = self.layer3(x)
+        x4 = self.layer4(x3)  # [B, vision_width, grid_h, grid_w]
+        B, C, H, W = x4.shape
+        return x3.float(), x4.reshape(B, C, H * W).permute(0, 2, 1).float()  # [B, N, vision_width]
+
+    def forward(self, images):
+        """x4 patches only -- see forward_multi."""
+        return self.forward_multi(images)[1]
 
     def _attnpool_forward(self, patch_feats):
         """Shared by project()/project_global() below -- one attnpool call produces both outputs

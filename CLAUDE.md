@@ -9,9 +9,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Part-based person re-identification: BPBreID's pixel-to-part attention pooling on top of CLIP's
 frozen RN50 visual tower, with CLIP-ReID-style per-identity, per-part prompt learning. Package
 `pcr/`, driver scripts `examples/`, YAML configs `configs/`. Started as a snapshot of `pcr2` at its
-best baseline (82.2/91.8 mAP/R1 on Market1501) and then reworked around one thesis: **part
-prompts must be tied to anatomy, or they collapse into identity vectors** (measured: 0.98 cosine
-between one identity's five part prompts under the old design). Origin:
+best baseline and then reduced to **CLIP-ReID's image path + one branch per body part**, after
+the original design was found to pool every part from an attention path that made all parts
+copies of the global (part-vs-part cosine 0.976 in the frozen encoder; every branch alone scored
+the same mAP as all seven together). Origin:
 `github.com/lakshchawla/pcr_baseline_high`, branch `main`. History is a single `initial_commit`;
 `progress.md` holds the dated rationale for everything since.
 
@@ -48,61 +49,48 @@ before touching configs or `examples/logs/` — a long run is often live on the 
 | Stage | Script | Trains | Reads → writes |
 |---|---|---|---|
 | 0 | `train_bpa_segmentation_rn50.py` | `pixel_classifier` (BN + 1×1 conv) on PifPaf masks, backbone frozen | → `stage0_bpa_rn50/model_best.pth.tar` |
-| 1 | `train_relational_prompts.py` | `PromptLearner.ctx`, TAB, `AttentionPoolingBlock`, SupCon temperature; **`pixel_classifier` while the blend is active** | Stage 0 ckpt → `prompt_learner.pth`, `pool.pth`, `identity_visibility.pth`, **`pixel_classifier.pth`** |
+| 1 | `train_relational_prompts.py` | `PromptLearner.ctx` + SupCon temperature only | Stage 0 ckpt → `prompt_learner.pth` |
 | — | `cache_text_anchors.py` | nothing (replay) | Stage 1 dir → `text_prototypes.pth` |
-| 2 | `train_relational_finetune.py` | backbone + `pixel_classifier` + pool + BN necks + id head | `text_prototypes.pth`, `pool.pth`, **`pixel_classifier.pth`** → `model_best.pth.tar` |
-| 3 | `train_uda.py` / `train_usl.py` | optional SpCL-style adaptation, argparse-driven, untouched by all of the above | |
+| 2 | `train_relational_finetune.py` | backbone + `pixel_classifier` + BN necks + id heads | Stage 0 ckpt, `text_prototypes.pth` → `model_best.pth.tar` |
+| 3 | `train_uda.py` / `train_usl.py` | optional SpCL-style adaptation, argparse-driven, untouched | |
 
-Branch order is load-bearing everywhere: `0 = global (pooled), 1..K=5 = parts, 6 = CLIP-native
-global (RN50 only)`. `has_global` comes from `encoder._has_global`; never hardcode it.
+Branch order is load-bearing everywhere: `0 = global (x_proj), 1..K=5 = parts`. `encoder.num_parts`
+is M = 1+K (Stage 3 reads it).
 
-## Image side (`pcr/models/`)
+## Architecture (2026-09-17 rewrite: CLIP-ReID + per-part branches, nothing else)
 
-- `clip_rn50_bpam_encoder.py::ClipRN50DenseBackbone` — frozen CLIP RN50, last stride dropped,
-  `_attnpool_forward` with **`query=x`** (every location as query; `x[:1]` was tried and returns
-  an empty `project()` — don't reintroduce it). `project_all` → per-patch joint feats + native
-  global; `project_dense` → MaskCLIP-style `c_proj(v_proj(patch))`, attention-free.
-- `clip_dense_part_encoder.py::ClipBPAMEncoder._forward_common(images, text_contexts=None,
-  blend_weight=0.0, stop_mask_grad=False)` — classifier softmax → optional **CLIP-native mask
-  blend** (`clip_native_masks.py`: each patch cosine-matched against *its own identity's* K part
-  texts; only the classifier's *foreground* mass is redistributed, background untouched, probs
-  still sum to 1) → GWAP pooling → visibility. All defaults off ⇒ bit-identical to the pre-blend
-  encoder (verified). Blend diagnostics + the reverse-KL **anchor loss** + `blended_probs` come
-  back through `encoder.last_blend_stats`. `stop_mask_grad` detaches the classifier from the
-  pooled features so it learns only from mask losses.
-- `relation_blocks.py` — `TextualAttentionBlock` (TAB, **gated**, zero-init; `gated=False` only to
-  replay pre-gate checkpoints) and `AttentionPoolingBlock` + `apply_part_pooling`. **VAB and CAB
-  are gone** (VAB gate never left 0 in two real runs; CAB never ran at retrieval). The K part
-  tokens are never mixed with each other on the image side.
-- `evaluators.py` — `extract_features(model, loader, pool=None)`, `Evaluator(model, pool=None)`.
-  Nothing text-side at retrieval.
+- `clip_rn50_bpam_encoder.py::ClipRN50DenseBackbone` — frozen-loadable CLIP RN50, layer4 stride
+  dropped (24×8 grid at 384×128). `forward_multi` → `(x3, x4 patches)`; `project_global` → CLIP's
+  real global (mean-token attnpool, `x_proj`); `project_dense` → MaskCLIP `c_proj(v_proj(patch))`.
+  **Never pool parts from the attention path** (`project`/`project_all`, kept for reference):
+  every-location-query attnpool made every patch ≈ the same image-wide average (part-vs-part
+  cos 0.976 frozen); `project_dense` gives 0.76–0.80.
+- `clip_dense_part_encoder.py::ClipBPAMEncoder.forward_multi` → dict `x3, x4, x_proj, part_x4
+  [B,K,2048], part_xproj [B,K,1024], vis [B,1+K], pixels_cls_scores`. `forward()` →
+  `(joint_branches [B,1+K,1024], vis)` = what retrieval and Stage 1 use. The CLIP-native mask
+  blend (`text_contexts`, `blend_weight`, `stop_mask_grad`, `last_blend_stats`) is still there,
+  opt-in, verified no-op by default — not wired into any script now.
+- `prompt_learner.py` — ctx → template → frozen text encoder. **No TAB, no VAB, no CAB, no pool**
+  (`relation_blocks.py` deleted): VAB's gate never left 0, CAB never ran at retrieval, TAB was the
+  fastest route to prompt collapse. Each part aligns to its own prompt, separately.
+- `evaluators.py` — `Evaluator(model)`, `extract_features(model, loader)`; part-wise
+  visibility-aware distance over the joint-space branches.
 
-## Text side + Stage 1 losses
+**Stage 1 losses:** SupCon i2t/t2i per branch (cross-identity negatives, full table/cache) +
+`PartDiagLoss` (`pcr/loss/part_diag_loss.py`: image part *k* vs the same person's other parts —
+the anti-collapse term). **Stage 2 losses** (= CLIP-ReID's + parts): id on BN(x4), BN(x_proj),
+BN(part_x4[k]) vis-weighted; triplet on x3/x4/x_proj + one BPBreID part-triplet over part_x4;
+align (CLIP-ReID's I2T) x_proj↔prototype 0 and part_xproj[k]↔prototype k; BPA. Recipe = CLIP-ReID
+RN50: lr 3.5e-4, batch 64, 120 ep, ×0.1 at 40/70, 10-ep warmup. (**5e-6 is the ViT recipe** — it
+gave 75.9 mAP here.)
 
-`ctx[y] → TAB → "A photo of a [ctx_k] person." → frozen CLIP text encoder → branch_texts`, a
-function of identity alone — **that is what lets `cache_text_anchors.py` freeze it**. Any
-image-conditioned change to the text path breaks the train/cache equality; a cross-attention
-that *modifies* the prompt must condition on per-identity centroids, not per-image features.
-
-| Loss | Negatives | Config |
-|---|---|---|
-| SupCon i2t / t2i (per branch) | other identities (full table / full cache) | `loss.temperature` (learnable) |
-| `PartDiagLoss` (`pcr/loss/part_diag_loss.py`) | the **same person's other parts** — the set SupCon lacks; the anti-collapse term | `part_diag:` |
-| `L_anchor` (reverse KL text-map ‖ classifier map) | — | `clip_native_mask.anchor_weight` (× β/β_max) |
-| `L_bpa` + `L_distil` (`pcr/utils/mask_targets.py`) | — | `bpam:` (only while β > 0) |
-
-Once β > 0, each PK batch's images + masks are re-read (`get_batch_image_loader`, deterministic
-transform = the cache transform) and run live; the full feature cache is rebuilt every
-`bpam.recache_every` epochs. `blend_weight_max: 0` reproduces the pre-blend script exactly.
-
-**Epoch-line metrics to read:** `part-ctx cos` (same-identity different-part text cosine; 0.98 =
-collapsed, want well below 0.9), `mask delta/part` (text map vs classifier, β-independent),
-`outside-support`, `bpa`, `distil`. Iteration line: `TAB gate`, `Pool gate`, `part_diag`,
-`anchor`.
+**Metrics to read:** Stage 1 `part-ctx cos` (want ≪ 0.9; 0.98 = collapsed), Stage 2 `part_cos`
+(train-mode BN, so higher than eval), `align_parts`, `tri_parts`. Per-branch retrieval ablation
+(global-only vs parts-only vs all) is the decisive check that parts carry information — see
+progress.md 2026-09-17 (4) for the script pattern.
 
 ## Conventions
 
-- Zero-init `tanh(gate) * delta` residual for every trainable block; a block is a no-op at init.
 - Every embedding a loss touches is L2-normalized first; temperatures are calibrated for cosines.
 - Visibility weights inside losses are detached (no "hide the part instead of aligning it").
 - Configs carry the *reason* for each non-default value in a comment; update it with the value.

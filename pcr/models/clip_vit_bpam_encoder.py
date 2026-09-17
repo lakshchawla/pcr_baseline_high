@@ -120,6 +120,18 @@ class ClipViTDenseBackbone(nn.Module):
         convention for every embedding a loss touches."""
         return (self.ln_post(patch_feats.type(self.dtype)) @ self.proj).float()
 
+    def forward_multi(self, images):
+        """ViT has no layer3-style intermediate map to hand out; returns (None, patches) so
+        ClipBPAMEncoder can treat both backbones the same way (x3-based terms are simply
+        skipped when x3 is None)."""
+        return None, self.forward(images)
+
+    def project_global(self, patch_feats):
+        """ViT-family CLIP has no attnpool; its native global is the CLS token, which forward()
+        deliberately drops (V-V surgery). The mean of the projected patch tokens stands in --
+        the same stand-in MaskCLIP's ViT path uses."""
+        return self.project(patch_feats).mean(dim=1)
+
     def project_dense(self, patch_feats):
         """Same as project(): ln_post + proj is already a per-token affine map with no attention
         in it (the V-V surgery in forward() is what keeps each token's own identity), so the

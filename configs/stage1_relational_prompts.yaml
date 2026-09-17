@@ -1,138 +1,49 @@
-# Stage 1: per-branch CLIP prompt learning, with relational mixing across a person's M=1+K
-# branches (global/foreground + K parts, uniformly) on both sides -- TextualAttentionBlock (owned
-# by PromptLearner) on the text side, VisualAttentionBlock on the image side.
+# Stage 1: per-identity, per-branch CLIP prompt learning -- CLIP-ReID's Stage 1 extended to K
+# body-part branches (see examples/train_relational_prompts.py's docstring). Image encoder:
+# ClipRN50BPAMEncoder (CLIP's frozen RN50 + Stage 0's pixel classifier), branch 0 = CLIP's own
+# global x_proj, 1..K = mask-pooled part_xproj (MaskCLIP dense projection -- see
+# pcr/models/clip_dense_part_encoder.py). Text: ctx -> template -> frozen CLIP text encoder, no
+# mixing block. Run examples/cache_text_anchors.py against this same config afterward.
 #
-# Image encoder is now ClipRN50BPAMEncoder (pcr/models/clip_rn50_bpam_encoder.py): CLIP's own
-# frozen RN50 visual tower (last-stride + every-location AttentionPool2d, see that file's own
-# docstring) with BPBreID's part-attention head on top, not BPBreIDEncoder(HRNet32) or
-# ClipViTBPAMEncoder -- replaces the old dead-code ClipImageEncoder placeholder entirely, since
-# this class now IS a real, used CLIP image encoder. clip.arch below must be RN50 to match (both
-# the image and text towers must come from the SAME CLIP checkpoint, or they aren't in the same
-# joint space at all -- see pcr/models/clip_rn50_bpam_encoder.py's own module docstring).
-# model.checkpoint_path now points at a ClipBPAMEncoder-shaped Stage 0 checkpoint (just the
-# pixel_classifier's state_dict -- see examples/train_bpa_segmentation_rn50.py, not
-# train_bpa_segmentation.py/train_bpa_segmentation_vit.py, which are HRNet/ViT-shaped and NOT
-# compatible with this encoder). examples/train_relational_prompts.py's build_encoder dispatches
-# on this same clip.arch string (ViT-* -> ClipViTBPAMEncoder, else -> ClipRN50BPAMEncoder).
-# Switched back to RN50 for this pass -- a real full RN50 run reached mAP/R1 = 82.2/91.8 and this
-# branch's Track A/B additive fixes (global-embedding branch + per-identity centroid loss, see
-# pcr/models/clip_dense_part_encoder.py and pcr/models/hm.py) are RN50-only for now (ViT stays on
-# ClipViTBPAMEncoder's own separate configs when it's tested again).
-#
-# CLIP text encoder and the CLIP backbone are frozen here; ctx (incl. TextualAttentionBlock),
-# the pooling block, and -- while the blend is active -- pixel_classifier train; see
-# examples/train_relational_prompts.py's own docstring for the full Algorithm 1 this file's
-# script now follows exactly. Run examples/cache_text_anchors.py against this same config
-# afterward to build Stage 2's frozen text-prototype table.
-#
-# Renamed from stage1_prompt_learning.yaml -- pairs with the renamed script; the tab:/pool:
-# sections below are the new content relative to that file. No visibility: section -- the
-# upstream image-level filter this used to configure was removed (see progress.md's entry on
-# this); every image is used, weighted per-part inside SupConLoss instead.
+# clip.arch must match the image tower's checkpoint: image and text towers must come from the
+# SAME CLIP checkpoint or they aren't in one joint space (pcr/models/clip_rn50_bpam_encoder.py).
 
 model:
-  # Stage 0's trained pixel-classifier checkpoint for ClipRN50BPAMEncoder (state dict key
-  # 'pixel_classifier', see that file's own docstring) -- NOT a full BPBreID/ViT checkpoint.
+  # Stage 0's trained pixel-classifier checkpoint (state dict key 'pixel_classifier') -- NOT a
+  # full BPBreID/ViT checkpoint.
   checkpoint_path: 'examples/logs/stage0_bpa_rn50/model_best.pth.tar'
-  dim_reduce_output: 1024    # RN50's own embed_dim (ClipRN50BPAMEncoder.num_features) -- must
-                              # equal clip.arch's text embed dim, both from the SAME CLIP checkpoint
-  parts_num: 5                # K body parts; num_branches = 2 (real global + foreground) + parts_num
-                                # on RN50 (ClipRN50DenseBackbone exposes project_global(), see
-                                # pcr/models/clip_dense_part_encoder.py's own docstring) -- read off
-                                # the encoder at runtime, not a value set here.
+  dim_reduce_output: 1024    # RN50's own embed_dim -- must equal clip.arch's text embed dim
+  parts_num: 5                # K body parts; num_branches = 1 + parts_num
 
 clip:
-  arch: RN50                    # must match the image encoder's own CLIP checkpoint (see model:
-                                # section's comment above) -- 1024-dim text embedding for RN50,
-                                # matching model.dim_reduce_output
-  n_ctx: 4                    # learnable context tokens per (identity, branch) -- kept at
-                                # CLIP-ReID's own original value; PromptLearner's prefix-length
-                                # measurement is independent of this now (see that file's own
-                                # docstring), so this can change safely later without corrupting
-                                # the prompt structure, unlike before that fix
-
-tab:
-  num_heads: 4                 # TextualAttentionBlock's attention heads, over all M=1+K branches
-  num_layers: 1                # start shallow -- see progress.md for the ablation this should feed
-
-pool:
-  num_heads: 4                 # AttentionPoolingBlock's heads (the global-embedding aggregator
-                                # over the K foreground-gated parts). No vab:/relalign: sections
-                                # any more -- VisualAttentionBlock and L_relalign were removed
-                                # (gate never left zero in two real runs; see
-                                # pcr/models/relation_blocks.py's module docstring).
-
-bpam:
-  # BPAM continuation: pixel_classifier keeps training while the blend is active -- BPA on real
-  # PifPaf masks (Stage 0's own loss, continued, same inverse-sqrt-frequency class weights) plus
-  # distillation toward the blended, text-refined part map, so the localization the prompts
-  # sharpened is baked into the text-free classifier that Stage 2 and retrieval actually run.
-  # Gradient reaches the classifier ONLY through these two mask losses (stop_mask_grad), never
-  # through SupCon/part_diag. Saved as pixel_classifier.pth; Stage 2's model.checkpoint_path
-  # points there. Requires data.masks_dir (Market1501 only -- DukeMTMC has no masks).
-  lr: 0.0001                   # 10x below Stage 0's 0.001: this is refinement of a converged
-                                # head, and the target it distils from contains its own output
-  bpa_weight: 1.0
-  distill_weight: 1.0
-  recache_every: 1             # rebuild the full-dataset feature cache every N blend epochs (the
-                                # classifier moved, so cached features/visibility go stale)
-  class_weight_batches: 50     # mask batches sampled to estimate the BPA class weights
-
-clip_native_mask:
-  # MaskCLIP-style, text-matched part masks (pcr/models/clip_native_masks.py, blended inside
-  # ClipBPAMEncoder._forward_common -- see plans/agent_plan_clip_native_part_masks.md). Each
-  # batch's images are matched, patch by patch, against their OWN identity's current K part
-  # contexts, and that assignment takes over blend_weight of the pixel classifier's foreground
-  # mass. Same warmup/ramp/flat shape as part_diag below, but tuned on its own: contexts mean
-  # nothing until SupCon has shaped them, so the blend stays off through warmup. blend_weight_max
-  # 0 reproduces the pre-blend script exactly (no images are re-read) -- run that first as the
-  # regression baseline before comparing against 0.3; don't start higher than 0.3 without first
-  # confirming the pixel classifier alone is still a stable floor.
-  warmup_fraction: 0.3
-  ramp_fraction: 0.2
-  blend_weight_max: 0.3
-  mask_temperature: 0.07    # CLIP's own convention; ablate against loss.temperature separately
-  # L_anchor: reverse KL of the text-matched part assignment against the Stage-0 classifier's
-  # (foreground-weighted, target detached) -- lets the text map sharpen inside part k's region
-  # but taxes mass that leaves it. Applied at anchor_weight * (blend / blend_weight_max), so it's
-  # exactly zero whenever the blend is. Per-patch KL is O(1) (log K = 1.6 at worst), so this is a
-  # guardrail against the K maps converging on one region, not a target -- keep it small.
-  anchor_weight: 0.5
+  arch: RN50
+  n_ctx: 4                    # learnable context tokens per (identity, branch) -- CLIP-ReID's value
 
 part_diag:
-  # L_part_diag (pcr/loss/part_diag_loss.py): image part k vs the SAME person's K part contexts,
+  # L_part_diag (pcr/loss/part_diag_loss.py): image part k vs the SAME person's K part prompts,
   # and the reverse -- the within-identity negatives SupCon never sees. Measured before this
-  # existed: same-identity different-part text cosine 0.98 (parts collapsed into one identity
-  # vector). On from epoch 0 -- collapse is a property of the init (TAB mixes everything
-  # uniformly at random init), not something that only appears late. Each direction is bounded by
-  # log K = 1.6, vs SupCon's ~100 at start, so lambda_max 1.0 is still a small fraction.
+  # existed: same-identity different-part prompt cosine 0.98 (parts collapsed into one identity
+  # vector). On from epoch 0; each direction is bounded by log K = 1.6 vs SupCon's ~100 at start.
   warmup_fraction: 0.0
   ramp_fraction: 0.1
   lambda_max: 1.0
-  temperature: 0.05     # fixed, not SupCon's learnable one: within-person cosines are all high,
-                        # so this needs to be sharp from the start and shouldn't be coupled to a
-                        # temperature calibrated for the 751-identity pool
+  temperature: 0.05     # fixed: within-person cosines are all high, so this needs to be sharp
+                        # and shouldn't be coupled to SupCon's 751-identity-pool temperature
 
 data:
   dataset: market1501         # or dukemtmc-reid
   data_dir: ../datasets
   height: 384
   width: 128
-  masks_dir: pifpaf_maskrcnn_filtering   # PifPaf masks for the BPAM continuation (bpam: above);
-  masks_suffix: '.npy'                    # same on-disk layout Stage 0 / Stage 2 read
-  batch_size: 32               # PK batch size per SupCon training step (must be a multiple of num_instances)
-  num_instances: 4             # PK sampling over the cached feature set: batch_size // num_instances
-                                # identities per batch, num_instances cached images each (with
-                                # replacement if an identity has fewer) -- Algorithm 1 step 6
-  cache_batch_size: 32        # batch size for the one-off full-dataset feature-caching pass
+  batch_size: 32               # PK batch per SupCon step (multiple of num_instances)
+  num_instances: 4             # batch_size // num_instances identities per batch
+  cache_batch_size: 32         # for the one-off full-dataset feature-caching pass
   workers: 4
 
 optim:
-  # PyYAML (YAML 1.1) requires a decimal point in the mantissa for scientific notation to parse
-  # as a float -- confirmed directly: yaml.safe_load('1e-4') -> the string '1e-4', not a float,
-  # which would crash torch.optim.Adam(weight_decay=...). Plain decimal notation always parses
-  # correctly, so small values below are written that way rather than as scientific notation.
-  lr: 0.00035
+  # PyYAML needs a decimal point for scientific notation to parse as a float, so small values
+  # are written in plain decimal.
+  lr: 0.00035                  # CLIP-ReID's own Stage 1 value
   weight_decay: 0.0001
   epochs: 120
   warmup_epochs: 5
@@ -140,19 +51,12 @@ optim:
   lr_min: 0.000001
 
 loss:
-  # Initial value only -- SupConLoss's temperature is learnable (see that file's own docstring)
-  # and logged every epoch. 0.1, not SupConLoss's own original 1.0 (CLIP-ReID's value, tuned for
-  # comparing against one small batch's worth of identities): this loss compares against the full
-  # training set (751 identities / 12936 images) every step, and needs a sharper starting
-  # temperature to give a useful gradient at that scale from the first step onward.
+  # Initial value only -- SupConLoss's temperature is learnable and logged every epoch. 0.1, not
+  # CLIP-ReID's 1.0: this loss compares against the full training set every step and needs a
+  # sharper start at that scale.
   temperature: 0.1
 
 logging:
-  # Not stage1_prompts (HRNet32/512-dim), stage1_prompts_clip_vit_b16 (ViT-B/16/512-dim), or
-  # stage1_prompts_clip_vit_l14 (ViT-L/14/768-dim) -- this dir's prompt_learner.pth/vab.pth are
-  # trained against ClipRN50BPAMEncoder/1024-dim (now also a real 7-branch table, see model:
-  # section's comment above) and aren't compatible with any of those. Also receives
-  # pixel_classifier.pth (the BPAM continuation's output) for Stage 2.
   logs_dir: examples/logs/stage1_prompts_clip_rn50
   print_freq: 10
   seed: 1
