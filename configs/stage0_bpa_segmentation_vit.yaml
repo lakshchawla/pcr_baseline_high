@@ -1,0 +1,43 @@
+# Stage 0, ViT-backbone variant: trains only PixelToPartClassifier (BN + 1x1 conv) on top of a
+# frozen CLIP ViT -- see examples/train_bpa_segmentation_vit.py's own module docstring. Backbone
+# choice (model.clip_arch) also fixes dim_reduce_output implicitly (= that arch's embed_dim, 512
+# for ViT-B/16) -- no separate dim_reduce_output field, unlike the HRNet/ResNet configs, since the
+# backbone here can't be reduced to an arbitrary size the way a CNN's own head can.
+
+model:
+  clip_arch: ViT-B/16
+  checkpoint_path: ''        # optional: continue training an existing classifier checkpoint
+  parts_num: 5
+
+data:
+  dataset: market1501         # DukeMTMC-reID has no masks on disk -- market1501 only
+  data_dir: ../datasets
+  # ViT-B/16's patch_size=16 divides 384x128 exactly: grid comes out 24x8 -- the same grid size
+  # RN50 uses at this resolution (via its own last-stride trick), no dropped-edge-pixel caveat the
+  # way ViT-L/14's patch_size=14 had here.
+  height: 384
+  width: 128
+  batch_size: 64               # ~3.5x fewer parameters and a shorter patch sequence (24x8+1=193
+                                # tokens) than ViT-L/14's own 27x9+1=244 -- this batch size has
+                                # headroom to go higher if desired, not a tight fit like L/14's was.
+  workers: 4
+  masks_dir: pifpaf_maskrcnn_filtering
+  masks_suffix: '.npy'
+
+optim:
+  # Only a tiny BN+1x1-conv head trains (linear-probe-style optimization landscape) -- same
+  # reasoning and same values as the RN50 variant's own config.
+  lr: 0.001
+  weight_decay: 0.0005
+  epochs: 40
+  # 20 (50% of epochs, matching the RN50 config's own 10-of-20 proportion) -- a single meaningful
+  # StepLR decay at the schedule's midpoint. Keep this proportional to epochs if epochs changes
+  # again (see progress.md's entry on the ViT-L/14 run where step_size was left at 10 after epochs
+  # went 20->40, decaying three times instead of once and leaving the last quarter of training
+  # effectively frozen).
+  step_size: 20
+
+logging:
+  logs_dir: examples/logs/stage0_bpa_vit_b16
+  print_freq: 10
+  seed: 1

@@ -1,0 +1,35 @@
+# Stage 0, RN50-backbone variant: trains only PixelToPartClassifier (BN + 1x1 conv) on top of a
+# frozen CLIP RN50 -- see examples/train_bpa_segmentation_rn50.py's own module docstring.
+# model.clip_arch also fixes the final embedding dim implicitly (1024 for RN50, via
+# AttentionPool2d's own c_proj) -- no separate dim_reduce_output field, same reasoning as the ViT
+# variant's own config.
+
+model:
+  clip_arch: RN50
+  checkpoint_path: ''        # optional: continue training an existing classifier checkpoint
+  parts_num: 5
+
+data:
+  dataset: market1501         # DukeMTMC-reID has no masks on disk -- market1501 only
+  data_dir: ../datasets
+  height: 384                 # -> 24x8 grid with layer4's stride dropped to 1 (16x total
+                                # downsampling instead of stock CLIP's 32x)
+  width: 128
+  batch_size: 32
+  workers: 4
+  masks_dir: pifpaf_maskrcnn_filtering
+  masks_suffix: '.npy'
+
+optim:
+  # Only a tiny BN+1x1-conv head trains (linear-probe-style optimization landscape) -- higher LR
+  # and far fewer epochs than the HRNet/ResNet version's full-backbone training (lr 0.00035,
+  # epochs 60), which was tuned for a much harder, much higher-dimensional optimization problem.
+  lr: 0.001
+  weight_decay: 0.0005
+  epochs: 20
+  step_size: 10
+
+logging:
+  logs_dir: examples/logs/stage0_bpa_rn50
+  print_freq: 10
+  seed: 1

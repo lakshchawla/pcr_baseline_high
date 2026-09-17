@@ -1,0 +1,26 @@
+model:
+  backbone: hrnet32
+  checkpoint_path: ''
+  dim_reduce_output: 512
+  parts_num: 5
+
+data:
+  dataset: market1501
+  data_dir: ../datasets
+  height: 384
+  width: 128
+  batch_size: 32
+  workers: 4
+  masks_dir: pifpaf_maskrcnn_filtering
+  masks_suffix: '.npy'
+
+optim:
+  lr: 0.00035
+  weight_decay: 0.0005
+  epochs: 60
+  step_size: 20
+
+logging:
+  logs_dir: examples/logs/stage0_bpa
+  print_freq: 10
+  seed: 1

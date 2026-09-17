@@ -1,0 +1,178 @@
+# Stage 2: supervised backbone finetune, implementing "Algorithm 2 -- Stage 2: Backbone
+# Fine-Tuning" exactly (see progress.md's entry on this file for the full step-by-step mapping).
+#
+# Image encoder is now ClipRN50BPAMEncoder (pcr/models/clip_rn50_bpam_encoder.py): CLIP's own
+# RN50 visual tower + BPBreID's part-attention head, initialized from Stage 0's converged
+# RN50 checkpoint -- the SAME one Stage 1 used, frozen, as its own starting point (Stage 1
+# never updates it, so this is genuinely "the same weights", not a separate lineage). Unlike
+# BPBreIDEncoder(HRNet32), this backbone's own pretrained weights fine-tune here too (not just
+# BPAM's classifier head) -- Algorithm 2's own intent, and what makes L_align/L_crossalign below
+# load-bearing: they're what stops this fine-tuning drifting the backbone out of CLIP's own
+# pretrained joint space. Stage 1's prompts/CLIP text encoder are frozen and never loaded here at
+# all (only the frozen text_prototypes.pth/text_self_attention.pth tables they produced are read,
+# from stage1.prompt_dir). VisualAttentionBlock is *not* frozen -- it continues training here,
+# starting from Stage 1's weights (also read from stage1.prompt_dir). See
+# examples/train_relational_finetune.py. Its own build_encoder dispatches on clip.arch below
+# (ViT-* -> ClipViTBPAMEncoder, else -> ClipRN50BPAMEncoder), same convention as Stage 1.
+# Switched back to RN50 for this pass, matching stage1_relational_prompts.yaml -- this is where
+# Track A (real global-embedding branch) and Track B (per-identity centroid loss, loss.centroid_*
+# below) are actually being tested, per the real full-run baseline of mAP/R1 = 82.2/91.8.
+#
+# Renamed from stage2_backbone_finetune.yaml -- pairs with the renamed script; the vab: section
+# below is the new content relative to that file. No visibility: section -- the upstream
+# image-level filter this used to configure was removed (see progress.md's entry on this); every
+# image is used, weighted per-part inside CosineAlignLoss, with a loose hard exclusion for
+# triplet only (loss.triplet_visibility_min, below).
+
+model:
+  # Stage 0's trained pixel-classifier checkpoint for ClipRN50BPAMEncoder (state dict key
+  # 'pixel_classifier') -- the SAME checkpoint Stage 1 used going in, NOT a full BPBreID/ViT
+  # checkpoint and NOT Stage 1's own output (Stage 1 produces no encoder checkpoint at all).
+  checkpoint_path: 'examples/logs/stage0_bpa_rn50/model_best.pth.tar'
+  dim_reduce_output: 1024    # RN50's own embed_dim -- must match stage1's model.dim_reduce_output
+                              # and clip.arch's text embed dim, both from the SAME CLIP checkpoint
+  parts_num: 5
+
+clip:
+  arch: RN50                    # must match stage1's clip.arch and the image encoder's own CLIP
+                                # checkpoint -- see model: section's comment above
+
+stage1:
+  # directory produced by examples/train_relational_prompts.py + examples/cache_text_anchors.py --
+  # reads text_prototypes.pth (the frozen alignment target) and vab.pth (VisualAttentionBlock's
+  # Stage-1-trained starting weights, which this stage continues training) from here
+  prompt_dir: examples/logs/stage1_prompts_clip_rn50
+
+vab:
+  num_heads: 4                 # must match stage1's vab.num_heads/num_layers -- these define the
+  num_layers: 1                # architecture vab.pth's weights were trained for
+
+cab:
+  # CrossAttentionBlock: grounds each visual branch against its frozen text prototype before
+  # L_align reads it (see METHODOLOGY.md's Stage 2 / CAB section). L_crossalign ramps in on a
+  # schedule (0 during warmup, linear ramp, then flat) rather than from epoch 0, since CAB starts
+  # as an identity function (gate=0) and needs a few epochs of plain L_align pressure first.
+  num_heads: 4
+  crossalign_warmup_fraction: 0.25
+  crossalign_ramp_fraction: 0.15
+  crossalign_lambda_max: 0.3
+
+data:
+  dataset: market1501         # or dukemtmc-reid
+  data_dir: ../datasets
+  height: 384
+  width: 128
+  batch_size: 32
+  num_instances: 4             # PK sampling: batch_size // num_instances identities per batch
+  workers: 4
+  # Algorithm 2 step 9/16 treats L_attn (the BPA/pixel-supervision loss below) as mandatory, not
+  # optional -- default to Market1501's real masks (matching Stage 0's own default) rather than
+  # empty, so it's on by default. Judgment call, not blind literal compliance: even though Stage 0
+  # already trains BPAM via this exact supervision, Stage 2 goes on to update backbone+BPAM
+  # further via id/triplet/align gradients that know nothing about real part boundaries -- keeping
+  # L_attn active here is what stops that continued training from drifting BPAM's attention away
+  # from the real, mask-anchored split Stage 0 established, not a redundant repeat of Stage 0's
+  # job. "Pseudo part-parsing labels" in Algorithm 2's own wording is read as these same
+  # ground-truth-derived pixel targets (the only such labels this repo has), not a separate
+  # self-generated pseudo-labeling scheme. Set to '' to disable (e.g. training on dukemtmc-reid,
+  # which has no masks on disk, per progress.md) -- BPA loss stays fully optional in the code for
+  # exactly that case, this default just makes the intended, mask-available path match Algorithm
+  # 2 out of the box.
+  masks_dir: pifpaf_maskrcnn_filtering
+  masks_suffix: '.npy'
+
+loss:
+  id_weight: 1.0
+  # Algorithm 2's own loss formula (step 16) sums L_tri_global and L_tri_parts with equal,
+  # implicit weight -- both use this same triplet_weight rather than two separate knobs.
+  triplet_weight: 1.0
+  triplet_margin: 0.3
+  # Loose hard-exclusion floor for PartTripletLoss's parts_visibility mask ONLY -- batch-hard
+  # mining's max/min operations don't compose with soft weights, so triplet keeps a boolean
+  # exclude/include decision (unlike InfoNCE/align, which use continuous weighting). Deliberately
+  # much looser than the removed upstream image-level lambda_v_min=0.5 filter: this only needs to
+  # drop true degenerate cases (a branch reading as essentially never-visible), not gate whole
+  # images out of training the way that filter did.
+  triplet_visibility_min: 0.05
+  align_weight: 0.5             # lambda_clip in Algorithm 2's own notation -- the one term the
+                                 # algorithm itself gives an explicit, separate coefficient
+  # CosineAlignLoss is a softmax classification against the full identity-prototype table (see
+  # pcr/loss/clip_cosine_align_loss.py's own docstring) -- single-positive, like the original CLIP
+  # loss, so 0.07 (CLIP's own established optimal starting temperature) applies here, unlike Stage
+  # 1's SupConLoss (multi-positive, uses 1.0 instead -- see that file's own docstring for why the
+  # two losses' shapes call for different temperatures).
+  align_temperature: 0.07
+  # bpa_weight now cosine-decays from bpa_weight_initial to bpa_weight_floor over
+  # bpa_weight_decay_epochs, instead of a flat weight -- keeps L_attn from ever going fully
+  # slack as BPAM keeps changing through Stage 2, so its part definitions can't drift arbitrarily
+  # far from Stage 0/1's anatomical convention (which text_prototypes.pth is frozen against). See
+  # METHODOLOGY.md's Stage 2 section. Only used when data.masks_dir is set.
+  bpa_weight_initial: 1.0
+  bpa_weight_floor: 0.15
+  bpa_weight_decay_epochs: 20
+  # L_centroid (PartHybridMemory, pcr/models/hm.py, reused as a per-identity centroid table --
+  # see examples/train_relational_finetune.py's own module docstring): additive to triplet, not
+  # a replacement, so its own effect can be measured in isolation first. centroid_weight/
+  # centroid_temp start at the same order/value as this repo's other additive terms and SPCL's
+  # own default respectively; centroid_momentum is flagged as a real open question, not a settled
+  # choice -- SPCL's own 0.2 was tuned for Stage 3's comparatively stable backbone, while Stage
+  # 2's is unfrozen and moving fastest right after Stage 0/1 hand-off, so a momentum this high
+  # might lag the *current* backbone state more here than it does in Stage 3's steadier regime.
+  centroid_weight: 1.0
+  centroid_temp: 0.05
+  centroid_momentum: 0.2
+
+optim:
+  # CLIP-ReID's own Stage 2 recipe uses ~5e-6 here (not Stage 1's 3.5e-4) -- fine-tuning an
+  # already-pretrained CLIP backbone at prompt-learning-scale LR drags it out of CLIP's joint
+  # embedding space. Was 0.00035 (same as Stage 1, applied uniformly to backbone+heads via
+  # build_optimizer's flat RN50 param group) -- 70x CLIP-ReID's own value.
+  lr: 0.000005
+  weight_decay: 0.0005
+  epochs: 120
+  step_size: 70
+  # BoT's own recommended schedule (Luo et al., "Bag of Tricks and a Strong Baseline for Deep
+  # Person Re-identification", CVPRW 2019) -- ~10 epochs of linear warmup before the backbone (just
+  # unfrozen here, unlike Stage 1) and its three newly-interacting losses (id/triplet/align) hit
+  # full LR; starting warmup at 1% of the base LR is BoT's own reference value.
+  warmup_epochs: 10
+  warmup_factor: 0.01
+
+# ViT-only knobs (examples/train_relational_finetune.py::build_optimizer) -- never read on the
+# RN50/HRNet32 path, so present here without affecting that path at all. Added after a real
+# comparison run showed ViT-L/14 underperforming RN50 (mAP 77.0/R1 99.0 vs 84.5/93.5) despite
+# matched Stage 0 training budget -- traced to optim: above being a single global LR/WD tuned
+# against a CNN (BoT's own recipe) and applied uniformly to a 24-block transformer, which the
+# published ViT fine-tuning literature consistently flags as destabilizing relative to CNNs at
+# this data scale (751 Market1501 identities). See build_optimizer/_llrd_param_groups' own
+# docstrings for the full reasoning.
+vit:
+  # Layer-wise LR decay rate: build_optimizer computes num_blocks from the loaded backbone at
+  # runtime (12 for ViT-B/16, was 24 for ViT-L/14) -- depth d (0=patch-embed, num_blocks=last
+  # resblock, num_blocks+1=ln_post/proj) trains at lr * llrd_decay^(num_blocks+1-d). 0.75 is a
+  # commonly-used starting point in BEiT/ELECTRA-style LLRD recipes -- not separately tuned for
+  # this repo yet, and not re-tuned specifically for B/16's shallower 12-block depth either (see
+  # _llrd_param_groups' own docstring: fewer layers means the same per-layer rate already reaches
+  # a less extreme floor at the earliest depth, which is somewhat self-correcting).
+  llrd_decay: 0.75
+  # Longer than optim.warmup_epochs (10) -- BoT's own number was tuned for a CNN backbone; a
+  # freshly-unfrozen, heavily-pretrained ViT benefits from proportionally more warmup before any
+  # layer (even at its own LLRD-scaled LR) hits full speed.
+  warmup_epochs: 20
+
+logging:
+  # New dir, not the old stage2_finetune (BPBreIDEncoder(HRNet32)-shaped 'state_dict', a
+  # BPBreID.state_dict(), not a ClipBPAMEncoder.state_dict() -- incompatible regardless of dim)
+  # or stage2_finetune_clip_vit_b16/_vit_l14 (ClipBPAMEncoder-shaped but 512-dim/768-dim, not this
+  # arch's 1024-dim).
+  logs_dir: examples/logs/stage2_finetune_clip_rn50
+  print_freq: 10
+  eval_step: 10
+  seed: 1
+
+# Consumed by Stage 5 (pcr/models/fusion_head.py), not by this script itself -- carried here so
+# the fusion mode intended for a checkpoint travels with the config that produced it.
+fusion:
+  mode: fixed_weights          # or learned_gate
+  w_global: 1.0
+  w_part: 0.5
