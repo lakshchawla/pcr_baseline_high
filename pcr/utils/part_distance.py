@@ -46,26 +46,57 @@ def _compute_body_parts_dist_matrices(qf, gf, metric='euclidean'):
     return distances
 
 
-def _combine_chunk(body_part_dist, qf_vis_t, gf_vis_chunk_t, dist_combine_strat, is_bool):
-    """body_part_dist: [M, Nq, chunk]. qf_vis_t: [M, Nq]. gf_vis_chunk_t: [M, chunk]."""
-    if is_bool:
-        valid_mask = qf_vis_t.unsqueeze(2) * gf_vis_chunk_t.unsqueeze(1)  # [M, Nq, chunk]
-        if dist_combine_strat == 'max':
-            masked_dist = replace_values(body_part_dist, ~valid_mask, -1)
-            pairwise_dist, _ = masked_dist.max(dim=0)
-        elif dist_combine_strat == 'mean':
-            pairwise_dist = masked_mean(body_part_dist, valid_mask)
-        else:
-            raise ValueError('Body parts distance combination strategy "{}" not supported'.format(dist_combine_strat))
-    else:
-        soft_mask = torch.sqrt(qf_vis_t.unsqueeze(2) * gf_vis_chunk_t.unsqueeze(1))
-        pairwise_dist = masked_mean(body_part_dist, soft_mask)
-    return pairwise_dist
+def combine_part_distances(part_dist, weights, strat='mean', temperature=0.2):
+    """Collapses per-part distances into one distance per pair. part_dist: [M, ...] (one distance
+    matrix per part, first axis = parts). weights: [M, ...] float >= 0, the pair's per-part
+    visibility weight (0 = that part is not mutually visible and drops out exactly). Returns
+    [...], with -1 wherever no part has any weight (the caller replaces that sentinel).
+
+    'mean'  -- weighted mean (BPBReID's default). A single strongly different part is diluted by
+               the parts that agree: two people in all black with different shoes still come out
+               "similar" because 5 of 6 branches agree.
+    'lse'   -- weighted log-sum-exp over the parts, i.e. a SOFT MAXIMUM of the part distances --
+               equivalently a soft MINIMUM of the part similarities (with d = 1 - cos it is
+               exactly 1 - softmin(cos)):
+                   D = T * log( sum_k w_k exp(d_k / T) / sum_k w_k )
+               Every part's disagreement enters, weighted by exp(d_k / T): one part whose
+               similarity collapses drags the whole score with it (the "dynamic penalty"), while
+               parts that agree contribute only their share. T -> inf recovers the weighted mean,
+               T -> 0 the hard max; equal d_k give D = d_k regardless of T. On unit-norm
+               features euclidean d is in [0, 2] and typical between-part gaps are 0.1-0.5, so
+               T = 0.2 makes a 0.3 gap count ~4.5x -- max-leaning without being brittle.
+    'max'   -- hard maximum over the mutually visible parts.
+    """
+    if strat == 'mean':
+        return masked_mean(part_dist, weights)
+    total_w = weights.sum(dim=0)
+    invalid = total_w == 0
+    if strat == 'max':
+        masked = part_dist.masked_fill(weights == 0, float('-inf')).max(dim=0)[0]
+        return masked.masked_fill(invalid, -1)
+    if strat == 'lse':
+        log_w = torch.log(weights.clamp(min=1e-12)).masked_fill(weights == 0, float('-inf'))
+        lse = torch.logsumexp(log_w + part_dist / temperature, dim=0)  # -inf where nothing is visible
+        combined = temperature * (lse - torch.log(total_w.clamp(min=1e-12)))
+        return combined.masked_fill(invalid, -1)
+    raise ValueError('Body parts distance combination strategy "{}" not supported'.format(strat))
+
+
+def _combine_chunk(body_part_dist, qf_vis_t, gf_vis_chunk_t, dist_combine_strat, is_bool, temperature):
+    """body_part_dist: [M, Nq, chunk]. qf_vis_t: [M, Nq]. gf_vis_chunk_t: [M, chunk]. Hard
+    (bool) visibility gives 0/1 weights; soft visibility the geometric mean sqrt(v_q * v_g)."""
+    pair_vis = qf_vis_t.unsqueeze(2) * gf_vis_chunk_t.unsqueeze(1)  # [M, Nq, chunk]
+    weights = pair_vis.float() if is_bool else torch.sqrt(pair_vis)
+    return combine_part_distances(body_part_dist, weights, dist_combine_strat, temperature)
 
 
 def compute_bpb_pairwise_distance(qf, qf_vis, gf=None, gf_vis=None, dist_combine_strat='mean',
-                                   metric='euclidean', batch_size=DEFAULT_BATCH_SIZE):
+                                   metric='euclidean', batch_size=DEFAULT_BATCH_SIZE, temperature=0.2):
     """Part-based pairwise distance between two sets of BPBReID embeddings.
+
+    dist_combine_strat / temperature: how the M per-part distances collapse into one -- see
+    combine_part_distances ('mean' is BPBReID's default and what Stage 3 still uses; the CLIP
+    stages pass 'lse').
 
     qf, gf: [N, M, D] per-branch (foreground + K parts) embeddings.
     qf_vis, gf_vis: [N, M] visibility, either bool (hard) or float in [0, 1] (soft).
@@ -108,7 +139,7 @@ def compute_bpb_pairwise_distance(qf, qf_vis, gf=None, gf_vis=None, dist_combine
         running_max = torch.maximum(running_max, body_part_dist.max())
 
         pairwise_dist[:, start:end] = _combine_chunk(body_part_dist, qf_vis_t, gf_vis_chunk_t,
-                                                       dist_combine_strat, is_bool)
+                                                       dist_combine_strat, is_bool, temperature)
         del body_part_dist
 
     max_value = running_max + 1

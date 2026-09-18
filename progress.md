@@ -2752,3 +2752,51 @@ batch 32), all into scratch dirs. Full-repo py_compile clean. CLAUDE.md rewritte
 **Next**: full Stage 1 -> anchors -> Stage 2 run, then the per-branch retrieval ablation on the
 result: parts-only / global-only / all. That single table decides whether the parts carry
 information the global doesn't.
+
+### 2026-09-18 -- Soft-min (log-sum-exp) part combination replaces the mean, at retrieval and in the part triplet
+
+**Problem this targets**: two people in all black with different shoes. With K distinct part
+features the shoe branch already differs -- but BPBReID's part-wise distance is a MEAN over
+branches, so five agreeing parts average one disagreeing part away and the pair still scores
+"similar". The principle: one part whose similarity collapses must penalize the whole score.
+
+**Change**: `pcr/utils/part_distance.py::combine_part_distances(part_dist, weights, strat, T)`
+-- one shared rule with 'mean' (BPBReID default), 'max', and 'lse': a visibility-weighted
+log-sum-exp over parts, D = T * log(sum_k w_k exp(d_k/T) / sum_k w_k) -- a soft maximum of the
+part distances, i.e. (with d = 1 - cos) exactly a soft MINIMUM of the part similarities, with each
+part's disagreement entering weighted by exp(d_k/T) (the dynamic penalty). T -> inf recovers the
+mean, T -> 0 the hard max, equal d_k give D = d_k; invisible parts (w = 0) drop out exactly; -1
+sentinel when no part is mutually visible (same contract as before). Used by
+`compute_bpb_pairwise_distance` (new `dist_combine_strat='lse'`, `temperature`; default still
+'mean' so Stage 3 / jaccard re-ranking are untouched), by `pcr/evaluators.py` (`Evaluator(model,
+part_combine, temperature)`, `pairwise_distance(..., combine, temperature)`; when not 'mean' the
+plain mean is also logged every eval), and by `PartTripletLoss(combine, temperature)` so Stage 2's
+part triplet mines its hard negatives under the SAME rule retrieval scores with. Config:
+`eval.part_combine: lse`, `eval.lse_temperature: 0.2` (unit-norm features, d in [0,2],
+between-part gaps 0.1-0.5: a 0.3 gap counts ~4.5x).
+
+Shoe case, numerically: five parts at d=0.2 and one at d=1.0 -> mean 0.333, lse(T=0.2) 0.659,
+max 1.0.
+
+**Verified**: unit gates (shoe case; equal d -> d; T->inf == weighted mean and T->0 == max in
+fp64; an invisible part with d=99 drops out exactly; -1 sentinel; chunked
+compute_bpb_pairwise_distance('lse') == direct combination with soft visibility; PartTripletLoss
+with 'lse' backprops, finite). Full-repo py_compile clean.
+
+**Probe on the FROZEN encoder (Stage 0 weights only -- no trained checkpoint of the new
+architecture exists locally; the scratch smoke checkpoint was cleared)**, top-1% most
+global-similar cross-identity query/gallery pairs (n=540k) vs same-identity pairs (n=63k):
+every branch's distance is LOWER on the hard cross-id pairs than on same-id pairs (e.g. part 5:
+0.509 vs 0.550), so no combination rule can separate them -- the parts don't yet encode the
+difference, and the rule can only surface a difference that exists. Retrieval on the frozen
+encoder: mean 10.0 mAP, lse T=0.5 9.97, T=0.2 9.72, T=0.1 9.03, max 6.15 -- on uncalibrated parts
+the soft-max amplifies noise, as expected. (Side note: the frozen 6-branch mean, 10.0, is double
+the frozen x_proj alone, 5.0 -- the parts already carry information zero-shot.)
+
+So this commit is the MATCHING half of the principle; the decisive test is the same probe on a
+Stage 2 checkpoint trained with the part triplet mined under 'lse'. The LOSS half (per-part
+contrast against every other identity's same part -- PartHybridMemory centroids per (identity,
+part), and K separate per-part batch-hard triplets instead of one combined call) is the next
+step; it is what makes the per-part distances calibrated enough for the soft-min to help rather
+than amplify noise. The hard-pair probe (per-branch distance on hard cross-id vs same-id pairs,
+under mean / lse / max) is the number to watch, before any mAP.

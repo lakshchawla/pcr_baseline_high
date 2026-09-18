@@ -13,15 +13,19 @@ Losses, mirroring CLIP-ReID's own composition and adding the parts as extra bran
   L_id      CE (label-smoothed) on BN(x4), BN(x_proj)  [CLIP-ReID]  + BN(part_x4[k]) per part,
             each part's term weighted by that part's visibility
   L_tri     batch-hard triplet on x3, x4, x_proj      [CLIP-ReID]  + one BPBreID-style
-            part-based triplet over part_x4 (visibility-masked part-distance mean)
+            part-based triplet over part_x4 (visibility-weighted, parts combined with the same
+            soft-min rule retrieval uses -- cfg.eval.part_combine)
   L_align   x_proj vs identity y's text prototype 0   [CLIP-ReID's I2T, as a softmax over the
             full prototype table]  + part_xproj[k] vs prototype k per part, visibility-weighted
             -- "each part index faces its own alignment with its own prompt context"
   L_bpa     pixel classifier vs real PifPaf masks (Stage 0's loss, continued), decayed
 
 Branch order everywhere: 0 = global, 1..K = parts. No VAB/TAB/CAB/pool, no centroid memory.
-Retrieval (pcr/evaluators.py) matches on the joint-space branches [x_proj, part_xproj] with
-visibility-aware part-wise distance.
+Retrieval (pcr/evaluators.py) matches on the joint-space branches [x_proj, part_xproj]: per-part
+distances combined by a visibility-weighted log-sum-exp (soft-max of part distances = soft-min of
+part similarities, pcr/utils/part_distance.py::combine_part_distances) instead of BPBReID's mean
+-- so one part that disagrees (two people in all black, different shoes) penalizes the whole
+score instead of being averaged away by the parts that agree.
 
 Two additions from "Bag of Tricks" (Luo et al., CVPRW 2019), both also in CLIP-ReID: BNNeck
 before every id classifier, and linear LR warmup. Config-driven: configs/stage2_relational_finetune.yaml.
@@ -364,7 +368,10 @@ def main_worker(cfg, setup_only=False):
     encoder = build_encoder(cfg)
     heads = Heads(num_identities, num_parts, encoder.backbone.vision_width, encoder.num_features).cuda()
 
-    triplet_loss = PartTripletLoss(margin=cfg.loss.triplet_margin).cuda()
+    # Same part-combination rule as retrieval (cfg.eval): the part triplet mines its hard
+    # negatives under the metric the model is tested with.
+    triplet_loss = PartTripletLoss(margin=cfg.loss.triplet_margin, combine=cfg.eval.part_combine,
+                                   temperature=cfg.eval.lse_temperature).cuda()
     id_loss = CrossEntropyLabelSmooth(num_identities).cuda()
     align_loss = CosineAlignLoss(temperature=cfg.loss.align_temperature).cuda()
     use_masks = bool(cfg.data.masks_dir)
@@ -386,7 +393,7 @@ def main_worker(cfg, setup_only=False):
     lr_scheduler = WarmupMultiStepLR(optimizer, milestones=list(cfg.optim.milestones), gamma=0.1,
                                       warmup_factor=cfg.optim.warmup_factor,
                                       warmup_iters=warmup_epochs, warmup_method='linear')
-    evaluator = Evaluator(encoder)
+    evaluator = Evaluator(encoder, part_combine=cfg.eval.part_combine, temperature=cfg.eval.lse_temperature)
 
     best_mAP = 0
     for epoch in range(cfg.optim.epochs):

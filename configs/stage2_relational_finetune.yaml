@@ -56,6 +56,18 @@ vit:
   llrd_decay: 0.75             # ViT only: layer-wise LR decay + longer warmup (see build_optimizer)
   warmup_epochs: 20
 
+eval:
+  # How the M per-part distances collapse into one, at retrieval AND inside the part triplet's
+  # mining (pcr/utils/part_distance.py::combine_part_distances). 'mean' is BPBReID's default and
+  # averages a single disagreeing part away (two people in all black, different shoes -> still
+  # "similar"). 'lse' is a visibility-weighted log-sum-exp = soft-max of part distances = soft-min
+  # of part similarities: every part's disagreement enters weighted by exp(d/T), so one part whose
+  # similarity collapses drags the pair's score with it. T -> inf is the mean, T -> 0 the hard max;
+  # on unit-norm features (d in [0,2], between-part gaps ~0.1-0.5) T=0.2 makes a 0.3 gap count
+  # ~4.5x. The evaluator logs the plain mean alongside every eval for comparison.
+  part_combine: lse
+  lse_temperature: 0.2
+
 logging:
   logs_dir: examples/logs/stage2_finetune_clip_rn50
   print_freq: 10

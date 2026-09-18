@@ -73,8 +73,12 @@ is M = 1+K (Stage 3 reads it).
 - `prompt_learner.py` — ctx → template → frozen text encoder. **No TAB, no VAB, no CAB, no pool**
   (`relation_blocks.py` deleted): VAB's gate never left 0, CAB never ran at retrieval, TAB was the
   fastest route to prompt collapse. Each part aligns to its own prompt, separately.
-- `evaluators.py` — `Evaluator(model)`, `extract_features(model, loader)`; part-wise
-  visibility-aware distance over the joint-space branches.
+- `evaluators.py` — `Evaluator(model, part_combine, temperature)`, `extract_features(model,
+  loader)`; part-wise visibility-aware distance over the joint-space branches. Per-part distances
+  are combined by **`combine_part_distances`** (`pcr/utils/part_distance.py`): `'lse'` = weighted
+  log-sum-exp = soft-max of part distances = soft-min of part similarities (one disagreeing part
+  penalizes the whole score — the "all black, different shoes" case), `'mean'` = BPBReID's default
+  (still what Stage 3 uses). Stage 2's `PartTripletLoss` mines under the same rule (`eval.*`).
 
 **Stage 1 losses:** SupCon i2t/t2i per branch (cross-identity negatives, full table/cache) +
 `PartDiagLoss` (`pcr/loss/part_diag_loss.py`: image part *k* vs the same person's other parts —

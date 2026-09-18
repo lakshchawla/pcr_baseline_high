@@ -5,7 +5,7 @@ embeddings: per-branch distance matrices are combined via a visibility-gated mea
 standard batch-hard mining, so a pair with no mutually-visible part is excluded from mining
 rather than compared on a made-up distance.
 
-Reuses masked_mean/replace_values from pcr/utils/part_distance.py for the visibility-gated
+Reuses combine_part_distances from pcr/utils/part_distance.py for the visibility-gated
 combination step (identical semantics: -1 marks "couldn't be compared"). Does NOT reuse that
 file's own _compute_body_parts_dist_matrices, because triplet training backpropagates through
 these distances and needs the epsilon-stabilized sqrt below (plain sqrt has an infinite gradient
@@ -22,14 +22,21 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from pcr.utils.part_distance import masked_mean
+from pcr.utils.part_distance import combine_part_distances
 
 
 class PartTripletLoss(nn.Module):
-    def __init__(self, margin=0.3, epsilon=1e-16):
+    def __init__(self, margin=0.3, epsilon=1e-16, combine='mean', temperature=0.2):
+        """combine / temperature: how the M per-part distances collapse into the one distance
+        batch-hard mining runs on -- the SAME rule retrieval uses (pcr/utils/part_distance.py::
+        combine_part_distances), so the model is mined under the metric it is tested with.
+        'lse' = soft-max of part distances: one strongly different part dominates the pair's
+        distance instead of being averaged away."""
         super(PartTripletLoss, self).__init__()
         self.margin = margin
         self.epsilon = epsilon
+        self.combine = combine
+        self.temperature = temperature
 
     def forward(self, part_based_embeddings, labels, parts_visibility=None):
         """part_based_embeddings: [N, M, D]. labels: [N]. parts_visibility: [N, M] bool or
@@ -40,12 +47,11 @@ class PartTripletLoss(nn.Module):
 
         if parts_visibility is not None:
             vis = parts_visibility.t()  # [M, N]
-            valid_mask = vis.unsqueeze(1) * vis.unsqueeze(2)  # [M, N, N]
-            if valid_mask.dtype is not torch.bool:
-                valid_mask = torch.sqrt(valid_mask)
-            pairwise_dist = masked_mean(part_based_pairwise_dist, valid_mask)
+            pair_vis = vis.unsqueeze(1) * vis.unsqueeze(2)  # [M, N, N]
+            weights = pair_vis.float() if pair_vis.dtype is torch.bool else torch.sqrt(pair_vis)
         else:
-            pairwise_dist = part_based_pairwise_dist.mean(0)
+            weights = torch.ones_like(part_based_pairwise_dist)
+        pairwise_dist = combine_part_distances(part_based_pairwise_dist, weights, self.combine, self.temperature)
 
         return self._hard_mine_triplet_loss(pairwise_dist.unsqueeze(0), labels, self.margin)
 

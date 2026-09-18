@@ -52,21 +52,24 @@ def extract_features(model, data_loader, print_freq=50):
     return features, visibilities, labels
 
 
-def pairwise_distance(features, visibilities, query=None, gallery=None):
+def pairwise_distance(features, visibilities, query=None, gallery=None, combine='mean', temperature=0.2):
     """Stacks query/gallery part embeddings + visibility and defers to
     compute_bpb_pairwise_distance (pcr/utils/part_distance.py) instead of a raw
-    2-2*x@y.T computation, since distances here are part-based, not flat vectors."""
+    2-2*x@y.T computation, since distances here are part-based, not flat vectors.
+    combine/temperature: how the per-part distances collapse into one -- see
+    combine_part_distances there ('mean' = BPBReID's default, 'lse' = soft-max of part
+    distances, i.e. soft-min of part similarities)."""
     if query is None and gallery is None:
         fnames = list(features.keys())
         x = torch.stack([features[f] for f in fnames], dim=0)
         xv = torch.stack([visibilities[f] for f in fnames], dim=0)
-        return compute_bpb_pairwise_distance(x, xv)
+        return compute_bpb_pairwise_distance(x, xv, dist_combine_strat=combine, temperature=temperature)
 
     x = torch.stack([features[f] for f, _, _ in query], dim=0)
     xv = torch.stack([visibilities[f] for f, _, _ in query], dim=0)
     y = torch.stack([features[f] for f, _, _ in gallery], dim=0)
     yv = torch.stack([visibilities[f] for f, _, _ in gallery], dim=0)
-    dist_m = compute_bpb_pairwise_distance(x, xv, y, yv)
+    dist_m = compute_bpb_pairwise_distance(x, xv, y, yv, dist_combine_strat=combine, temperature=temperature)
     return dist_m, x, y
 
 
@@ -108,14 +111,26 @@ class Evaluator(object):
     """Retrieval on the encoder's own joint-space branches with visibility-aware part-wise
     distance (pcr/utils/part_distance.py). Nothing text-side runs here: retrieval has no identity
     label to fetch a text context with (and the training identity set is disjoint from
-    query/gallery anyway) -- everything the text side contributed is baked into the weights."""
+    query/gallery anyway) -- everything the text side contributed is baked into the weights.
 
-    def __init__(self, model):
+    part_combine / temperature: how the per-part distances become one (combine_part_distances).
+    The reported result uses `part_combine`; when that is not 'mean', the plain mean is also
+    computed and logged so every eval shows what the soft-min penalty changed."""
+
+    def __init__(self, model, part_combine='lse', temperature=0.2):
         super(Evaluator, self).__init__()
         self.model = model
+        self.part_combine = part_combine
+        self.temperature = temperature
 
     def evaluate(self, data_loader, query, gallery, cmc_flag=False):
         features, visibilities, _ = extract_features(self.model, data_loader)
-        distmat, query_features, gallery_features = pairwise_distance(features, visibilities, query, gallery)
+        if self.part_combine != 'mean':
+            dist_mean, qf, gf = pairwise_distance(features, visibilities, query, gallery, combine='mean')
+            print('  [part-mean]', end=' ')
+            evaluate_all(qf, gf, dist_mean, query=query, gallery=gallery, cmc_flag=False)
+            print('  [part-{} T={}]'.format(self.part_combine, self.temperature), end=' ')
+        distmat, query_features, gallery_features = pairwise_distance(
+            features, visibilities, query, gallery, combine=self.part_combine, temperature=self.temperature)
         return evaluate_all(query_features, gallery_features, distmat,
                              query=query, gallery=gallery, cmc_flag=cmc_flag)
