@@ -2800,3 +2800,39 @@ part), and K separate per-part batch-hard triplets instead of one combined call)
 step; it is what makes the per-part distances calibrated enough for the soft-min to help rather
 than amplify noise. The hard-pair probe (per-branch distance on hard cross-id vs same-id pairs,
 under mean / lse / max) is the number to watch, before any mAP.
+
+### 2026-09-18 (2) -- Loss half of the per-part principle: centroid contrast per part + per-part triplets; hard-pair probe script
+
+- `pcr/models/hm.py::PerPartCentroidMemory` (new; PartHybridMemory left as is for Stage 3): one
+  momentum centroid per (identity, branch); for every branch m SEPARATELY, image branch m is
+  classified against all 751 identities' branch-m centroids (softmax over identities of cos/T,
+  T=0.05), CE at the true identity, per-part losses weighted by that sample's part visibility,
+  mean over parts. Centroids update only from parts above `triplet_visibility_min`. PartHybridMemory
+  was not reused because it averages the per-part similarities BEFORE its softmax -- the same
+  mean-dilution the soft-min retrieval rule removes. Verified: 0 loss at own centroid, corrupting
+  one part raises only that part's term, gradient flows, momentum update touches only the masked
+  (identity, part) slots and keeps unit norm.
+- Stage 2: `L_cen` on the joint-space branches (the features retrieval matches), weight 1.0,
+  centroids initialized from a no-grad pass over the training set (visibility-weighted mean per
+  (identity, branch)); logged as `cen` plus `cen0..cen5` -- a part with little identity
+  information sits at a high flat cen_k, which is the "black hair is a lot" reading. Per-part
+  triplets: K single-branch batch-hard calls on part_x4[k] (`tri_parts`) so each part mines its
+  own hard negatives, kept alongside the combined part triplet under the retrieval rule
+  (`tri_parts_lse`).
+- `examples/probe_hard_pairs.py` (new): retrieval under mean / lse(T...) / max and per branch
+  alone, plus the hard-pair probe (top-1% most global-similar cross-identity pairs vs same-identity
+  pairs: per-branch distance, max-over-parts, combined distance under each rule, gap in same-id
+  std units). This is the number that states the "all black, different shoes" problem.
+- Stage 2 `batch_size` comment corrected: 64 OOMs on the 8 GB laptop card (32 runs at ~6 GB
+  peak); 64 is for the server.
+
+Verified: unit gates for the memory; GPU 1-epoch Stage 1 -> anchors -> Stage 2 (batch 32) with
+every new term logging finite values, eval printing part-mean and part-lse; probe script runs on
+the resulting checkpoint (all gaps negative after one warm-up epoch, as expected -- the parts
+haven't trained yet).
+
+What to read after a full run: probe first, mAP second. Per-branch `hard-same` should turn
+positive for at least one part on the hard pairs while same-id distances stay flat; the lse gap
+should then exceed the mean gap. If a part's `cen_k` stays flat and high AND its hard-same stays
+~0, that part carries no identity information and is the candidate for the "one part's cosine
+explodes" handling deferred by the user.

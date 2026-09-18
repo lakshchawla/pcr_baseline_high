@@ -22,8 +22,9 @@ data:
   data_dir: ../datasets
   height: 384
   width: 128
-  batch_size: 64               # CLIP-ReID's RN50 recipe: 64 = P16 x K4 (measured 2 GB at 32 on
-  num_instances: 4             # the 8 GB card at 384x128, so 64 fits)
+  batch_size: 64               # CLIP-ReID's RN50 recipe: 64 = P16 x K4. Needs > 8 GB at 384x128
+  num_instances: 4             # with layer4 at stride 1 (OOM on the 8 GB laptop card, which runs
+                                # 32 at ~6 GB peak) -- 64 is for the training server.
   workers: 4
   # BPA supervision. Market1501's real masks; DukeMTMC-reID has none -- set masks_dir: '' there
   # and the BPA term is skipped.
@@ -37,6 +38,14 @@ loss:
   triplet_visibility_min: 0.05  # loose hard exclusion for the part-based triplet's mining only
   align_weight: 1.0             # CLIP-ReID's I2T weight (was 0.5)
   align_temperature: 0.07       # cosine / T against the full prototype table (rows unit-norm)
+  # L_cen (pcr/models/hm.py::PerPartCentroidMemory): per branch, image part m vs every
+  # identity's momentum centroid of part m, softmax over the 751 identities -- the widest
+  # "my part vs other people's same part" negative pool available. Per-part losses are logged
+  # (cen0 = global, cen1..5 = parts); a part that carries little identity information sits at a
+  # high, flat cen_k -- expected, not a bug. temp/momentum are SpCL's values, as before.
+  centroid_weight: 1.0
+  centroid_temp: 0.05
+  centroid_momentum: 0.2
   bpa_weight_initial: 1.0       # cosine decay to the floor over decay_epochs -- the classifier
   bpa_weight_floor: 0.15        # starts converged (Stage 0), so this is a tether, not training
   bpa_weight_decay_epochs: 20

@@ -12,9 +12,14 @@ and their per-part versions:
 Losses, mirroring CLIP-ReID's own composition and adding the parts as extra branches:
   L_id      CE (label-smoothed) on BN(x4), BN(x_proj)  [CLIP-ReID]  + BN(part_x4[k]) per part,
             each part's term weighted by that part's visibility
-  L_tri     batch-hard triplet on x3, x4, x_proj      [CLIP-ReID]  + one BPBreID-style
-            part-based triplet over part_x4 (visibility-weighted, parts combined with the same
-            soft-min rule retrieval uses -- cfg.eval.part_combine)
+  L_tri     batch-hard triplet on x3, x4, x_proj      [CLIP-ReID]  + K separate per-part
+            batch-hard triplets on part_x4[k] (each part mines its OWN hard negatives, so a part
+            that differs is never averaged away during training) + one combined part triplet
+            over part_x4 under the same soft-min rule retrieval scores with (cfg.eval.part_combine)
+  L_cen     per-part centroid contrast (pcr/models/hm.py::PerPartCentroidMemory): image branch m
+            vs ALL identities' momentum centroids of branch m, softmax over identities -- "my shoe
+            vs everyone else's shoe" with the full 751-identity negative pool, visibility-weighted,
+            logged per part (an uninformative part shows as an irreducibly high cen_k)
   L_align   x_proj vs identity y's text prototype 0   [CLIP-ReID's I2T, as a softmax over the
             full prototype table]  + part_xproj[k] vs prototype k per part, visibility-weighted
             -- "each part index faces its own alignment with its own prompt context"
@@ -51,6 +56,8 @@ from pcr.models.clip_rn50_bpam_encoder import ClipRN50BPAMEncoder
 from pcr.models.clip_vit_bpam_encoder import ClipViTBPAMEncoder
 from pcr.models.bn_neck import PartBNNecks
 from pcr.models.id_classifier import PartIdClassifiers
+from pcr.models.hm import PerPartCentroidMemory
+from pcr.evaluators import extract_features
 from pcr.loss import PartTripletLoss, CrossEntropyLabelSmooth, CosineAlignLoss, BodyPartAttentionLoss
 from pcr.evaluators import Evaluator
 from pcr.utils.config import load_yaml_config
@@ -253,7 +260,7 @@ def weighted_id_loss(logits, targets, weights, num_classes, epsilon=0.1):
     return (w * per_sample).sum() / w.sum().clamp(min=1e-8)
 
 
-def compute_losses(encoder, heads, id_loss, triplet_loss, align_loss, bpa_loss, text_prototypes,
+def compute_losses(encoder, heads, id_loss, triplet_loss, align_loss, bpa_loss, part_memory, text_prototypes,
                    imgs, mask, targets, cfg, epoch):
     out = encoder.forward_multi(imgs)
     K = encoder._k
@@ -289,11 +296,31 @@ def compute_losses(encoder, heads, id_loss, triplet_loss, align_loss, bpa_loss, 
         result = triplet_loss(feat.unsqueeze(1), targets)
         if result is not None:
             l_tri = l_tri + result[0]
+    # Per-part triplets: part k mined on ITS OWN distances (a single-branch call), so one part
+    # that separates two people is never diluted by the parts that don't -- the training-side
+    # counterpart of the soft-min retrieval rule.
+    l_tri_parts = imgs.new_zeros(())
+    for k in range(K):
+        r = triplet_loss(out['part_x4'][:, k:k + 1], targets, parts_visibility=vis_mask[:, k + 1:k + 2])
+        if r is not None:
+            l_tri_parts = l_tri_parts + r[0]
+    # Combined part triplet under the retrieval rule (cfg.eval.part_combine): trains the
+    # combination the evaluator actually scores with.
     part_result = triplet_loss(out['part_x4'], targets, parts_visibility=vis_mask[:, 1:])
-    l_tri_parts = part_result[0] if part_result is not None else imgs.new_zeros(())
-    total = total + cfg.loss.triplet_weight * (l_tri + l_tri_parts)
+    l_tri_lse = part_result[0] if part_result is not None else imgs.new_zeros(())
+    total = total + cfg.loss.triplet_weight * (l_tri + l_tri_parts + l_tri_lse)
     log['tri'] = l_tri.item()
     log['tri_parts'] = l_tri_parts.item()
+    log['tri_parts_lse'] = l_tri_lse.item()
+
+    # L_cen: per-part contrast against every identity's same-part centroid (see module
+    # docstring). On the joint-space branches -- the exact features retrieval matches on.
+    # Centroids update only from parts visible enough to trust (triplet_visibility_min).
+    l_cen, cen_parts = part_memory(proj_branches, targets, vis, vis_mask)
+    total = total + cfg.loss.centroid_weight * l_cen
+    log['cen'] = l_cen.item()
+    for m, v in enumerate(cen_parts.tolist()):
+        log['cen%d' % m] = v
 
     # L_align (CLIP-ReID's I2T): each joint-space branch classified against ITS OWN branch's
     # full frozen prototype table (every identity an implicit negative) -- global at weight 1,
@@ -377,6 +404,9 @@ def main_worker(cfg, setup_only=False):
     use_masks = bool(cfg.data.masks_dir)
     bpa_loss = BodyPartAttentionLoss().cuda() if use_masks else None
 
+    part_memory = PerPartCentroidMemory(encoder.num_features, num_branches, num_identities,
+                                        temp=cfg.loss.centroid_temp, momentum=cfg.loss.centroid_momentum).cuda()
+
     train_loader = get_train_loader(dataset, cfg, train_set)
     test_loader = get_test_loader(dataset, cfg.data.height, cfg.data.width, cfg.data.batch_size, cfg.data.workers)
 
@@ -386,6 +416,30 @@ def main_worker(cfg, setup_only=False):
                   num_identities, num_branches, tuple(text_prototypes.shape),
                   'ON (' + cfg.data.masks_dir + ')' if use_masks else 'off'))
         return
+
+    # Centroid init: one no-grad pass over the training set with the encoder as Stage 0/1 left
+    # it, visibility-weighted mean per (identity, branch) (plain mean where a branch is never
+    # visible for an identity) -- otherwise every row starts at zero and the softmax is
+    # meaningless until each identity has been seen once.
+    print('==> Initializing per-(identity, part) centroids')
+    encoder.eval()
+    init_loader = get_test_loader(dataset, cfg.data.height, cfg.data.width, cfg.data.batch_size,
+                                   cfg.data.workers, testset=train_set)
+    init_features, init_vis, _ = extract_features(encoder, init_loader)
+    sums = torch.zeros(num_identities, num_branches, encoder.num_features)
+    wsum = torch.zeros(num_identities, num_branches, 1)
+    plain = torch.zeros_like(sums)
+    counts = torch.zeros(num_identities, 1, 1)
+    for fname, pid, _ in train_set:
+        f, v = init_features[fname], init_vis[fname].float().unsqueeze(-1)
+        sums[pid] += f * v
+        wsum[pid] += v
+        plain[pid] += f
+        counts[pid] += 1
+    centers = torch.where(wsum > 0, sums / wsum.clamp(min=1e-6), plain / counts.clamp(min=1))
+    part_memory.features = F.normalize(centers, dim=-1).cuda()
+    del init_loader, init_features, init_vis, sums, wsum, plain, counts, centers
+    print('==> centroids initialized for {} identities x {} branches'.format(num_identities, num_branches))
 
     optimizer = build_optimizer(encoder, heads, cfg)
     is_vit = cfg.clip.arch.startswith('ViT')
@@ -415,7 +469,7 @@ def main_worker(cfg, setup_only=False):
 
             optimizer.zero_grad()
             loss, log = compute_losses(encoder, heads, id_loss, triplet_loss, align_loss, bpa_loss,
-                                       text_prototypes, imgs, mask, targets, cfg, epoch)
+                                       part_memory, text_prototypes, imgs, mask, targets, cfg, epoch)
             loss.backward()
             optimizer.step()
 

@@ -84,14 +84,17 @@ is M = 1+K (Stage 3 reads it).
 `PartDiagLoss` (`pcr/loss/part_diag_loss.py`: image part *k* vs the same person's other parts —
 the anti-collapse term). **Stage 2 losses** (= CLIP-ReID's + parts): id on BN(x4), BN(x_proj),
 BN(part_x4[k]) vis-weighted; triplet on x3/x4/x_proj + one BPBreID part-triplet over part_x4;
-align (CLIP-ReID's I2T) x_proj↔prototype 0 and part_xproj[k]↔prototype k; BPA. Recipe = CLIP-ReID
+align (CLIP-ReID's I2T) x_proj↔prototype 0 and part_xproj[k]↔prototype k; **`L_cen`**
+(`hm.py::PerPartCentroidMemory`: branch *m* vs every identity's branch-*m* centroid, per-part softmax,
+logged `cen0..cen5`); K per-part triplets + one combined under the soft-min rule; BPA. Recipe = CLIP-ReID
 RN50: lr 3.5e-4, batch 64, 120 ep, ×0.1 at 40/70, 10-ep warmup. (**5e-6 is the ViT recipe** — it
 gave 75.9 mAP here.)
 
 **Metrics to read:** Stage 1 `part-ctx cos` (want ≪ 0.9; 0.98 = collapsed), Stage 2 `part_cos`
 (train-mode BN, so higher than eval), `align_parts`, `tri_parts`. Per-branch retrieval ablation
-(global-only vs parts-only vs all) is the decisive check that parts carry information — see
-progress.md 2026-09-17 (4) for the script pattern.
+(global-only vs parts-only vs all) and the hard-pair probe are the decisive checks that parts
+carry information: `python examples/probe_hard_pairs.py --config ... --checkpoint ...` (read the
+probe before mAP; see progress.md 2026-09-18).
 
 ## Conventions
 

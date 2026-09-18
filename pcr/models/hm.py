@@ -104,3 +104,43 @@ class PartHybridMemory(nn.Module):
         mask = mask.expand_as(sim_by_label)
         masked_sim = masked_softmax(sim_by_label.t().contiguous(), mask.t().contiguous())
         return F.nll_loss(torch.log(masked_sim + 1e-6), targets)
+
+
+class PerPartCentroidMemory(nn.Module):
+    """Per-part contrast against every identity's SAME part (2026-09-18, see progress.md).
+
+    One momentum centroid per (identity, part): `features[y, m]`. For each branch m
+    SEPARATELY, image part m of sample b is classified against all N identities' part-m
+    centroids -- softmax over identities of cos(part_m, centroid[:, m]) / temp, cross-entropy at
+    the true identity -- and the per-part losses are averaged with the sample's own per-part
+    visibility as weights. This is the principle "push my shoe away from everyone else's shoe"
+    with the whole identity table (751) as the negative pool, not the ~16 identities in a batch.
+
+    Deliberately NOT PartHybridMemory: that class averages the per-part similarities into one
+    [B, N] similarity before its softmax, so a part that disagrees is diluted by parts that
+    agree -- exactly the failure the soft-min retrieval rule (pcr/utils/part_distance.py) was
+    introduced to remove. Here every part gets its own softmax, so an uninformative part (black
+    hair, say) shows up as an irreducibly high loss on that branch -- expected, and logged per
+    part -- without touching the others.
+
+    Same PartHM mechanics: einsum similarity + per-(sample, part) momentum update of the
+    centroids in backward, skipped for parts whose `update_mask` is False; centroids stay
+    unit-norm. Inputs are expected unit-norm (the joint-space branches)."""
+
+    def __init__(self, num_features, num_parts, num_identities, temp=0.05, momentum=0.2):
+        super(PerPartCentroidMemory, self).__init__()
+        self.num_parts = num_parts
+        self.temp = temp
+        self.momentum = momentum
+        self.register_buffer('features', torch.zeros(num_identities, num_parts, num_features))
+
+    def forward(self, inputs, targets, weights, update_mask):
+        """inputs: [B, M, D] unit-norm. targets: [B] identity indices. weights: [B, M] float,
+        per-part loss weight (visibility, detached inside). update_mask: [B, M] bool, which
+        (sample, part) slots update their centroid. Returns (loss, per_part [M])."""
+        sim = part_hm(inputs, targets, update_mask, self.features, self.momentum) / self.temp  # [B, M, N]
+        log_prob = F.log_softmax(sim, dim=-1)
+        nll = -log_prob.gather(-1, targets.view(-1, 1, 1).expand(-1, self.num_parts, 1)).squeeze(-1)  # [B, M]
+        w = weights.detach().clamp(min=1e-3)
+        per_part = (w * nll).sum(0) / w.sum(0).clamp(min=1e-8)  # [M]
+        return per_part.mean(), per_part.detach()
